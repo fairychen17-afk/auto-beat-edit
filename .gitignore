@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ---- 运行产物 ----
+output/
+*.edl.json
+*.wav.tmp
+
+# ---- 素材与音乐（版权归各自作者，不进仓库） ----
+material/
+run_material/
+bgm/
+run_bgm/
+bgm_douyin/
+bgm_lib/
+vocal_bgm/
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

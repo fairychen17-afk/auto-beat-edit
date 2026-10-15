@@ -1,0 +1,6 @@
+# 运行依赖（ffmpeg 由 imageio-ffmpeg 自带，无需单独安装）
+numpy>=1.24
+opencv-python-headless>=4.8
+librosa>=0.10
+scipy>=1.10
+imageio-ffmpeg>=0.4.9

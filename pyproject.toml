@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocut"
+version = "1.0.0"
+description = "自动卡点剪辑流水线：关键帧检测 + 素材感知编排 + BGM 匹配 + 转场/滤镜/变速自动成片"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "autocut" }]
+keywords = ["video", "editing", "beat-sync", "ffmpeg", "opencv", "librosa"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+]
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "librosa>=0.10",
+    "scipy>=1.10",
+    "imageio-ffmpeg>=0.4.9",
+]
+
+[project.scripts]
+autocut = "autocut.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fairychen17-afk/autocut"
+
+[tool.setuptools]
+packages = ["autocut"]
