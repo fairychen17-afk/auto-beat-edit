@@ -1,9 +1,11 @@
 """ffmpeg 渲染器：统一规格 → 镜头运动 → 卡点特效 → 调色 → xfade 转场链 → 混音 → 成品。
 
-xfade 链时序模型（转场中点即卡点）：
-    L_1 = c_1 + d/2, L_i = c_i + d (中间), L_n = c_n + d/2
-    O_k = sum(L_1..L_k) - d      （第 k 次 xfade 的 offset）
-    总时长 = sum(c_i)
+xfade 链时序模型（转场中点即卡点；每个边界可用各自的转场时长 d_k）：
+    L_1 = c_1 + d_1/2
+    L_i = c_i + (d_{i-1} + d_i)/2      （中间段）
+    L_n = c_n + d_{n-1}/2
+    O_k = sum(L_1..L_k) - sum(d_1..d_k)   （第 k 次 xfade 的 offset）
+    总时长 = sum(c_i) = sum(L_i) - sum(d_k)
 """
 from __future__ import annotations
 
