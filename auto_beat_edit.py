@@ -85,6 +85,11 @@ GLITCH_INTENSITY = 6.0
 MOTION_BLUR_INTENSITY = 0.4
 HUE_SHIFT_AMOUNT = 15.0
 
+# 重拍/弱拍分级：拍点强度 0~1（0.5 = 中等/无信息）映射到特效强度倍率。
+# strength 0.5 -> 1.0 倍（与未引入分级时完全一致），0 -> 1-STRENGTH_CONTRAST，
+# 1 -> 1+STRENGTH_CONTRAST：重拍更冲、弱拍更含蓄，而不是所有拍子一个强度。
+STRENGTH_CONTRAST = 0.5
+
 # 新增究极效果
 FISHEYE_ON = True
 PIXEL_ON = True
@@ -101,17 +106,44 @@ FAST_EXPORT = False
 # ==========================================================================
 # 数据结构
 # ==========================================================================
+def _normalize_strengths(raw):
+    """把拍点原始强度归一化到 0~1（用 10%~90% 分位抗离群）。
+
+    若强弱差异过小（例如均匀的合成点击轨、没有真正强弱拍的段落），直接统一记为
+    0.5（中等强度），避免把噪声放大成虚假的「重拍」，同时让特效强度保持旧行为。
+    """
+    raw = np.asarray(raw, dtype=float).flatten()
+    if raw.size == 0:
+        return raw
+    lo = float(np.percentile(raw, 10))
+    hi = float(np.percentile(raw, 90))
+    if hi - lo < 1e-9 or (hi - lo) < 0.05 * max(hi, 1e-9):
+        return np.full(raw.size, 0.5, dtype=float)
+    return np.clip((raw - lo) / (hi - lo), 0.0, 1.0)
+
+
 @dataclass
 class BeatGrid:
-    """音乐拍点分析结果。"""
+    """音乐拍点分析结果。
+
+    strengths 与 beats 一一对应，是每个整拍的「强度」0~1（相对值，来自 onset 强度包络），
+    用于区分重拍/弱拍、让特效强度跟着音乐走；无可靠强度信息时统一记为 1.0。
+    """
     beats: np.ndarray
     half_beats: np.ndarray
     tempo: float
     status: str = "ok"          # ok / few_beats_synthesized / empty_audio
+    strengths: np.ndarray = None
 
     def __post_init__(self):
         self.beats = np.asarray(self.beats, dtype=float).flatten()
         self.half_beats = np.asarray(self.half_beats, dtype=float).flatten()
+        raw = None if self.strengths is None else np.asarray(self.strengths).flatten()
+        if raw is None or raw.size != self.beats.size:
+            # 无强度信息 -> 中等强度 0.5（特效强度保持旧行为，不做虚假分级）
+            self.strengths = np.full(self.beats.size, 0.5, dtype=float)
+        else:
+            self.strengths = _normalize_strengths(raw)
 
     @property
     def beat_duration(self):
@@ -135,6 +167,7 @@ class EditSegment:
     reused: bool = False
     transition: str = "cut"
     note: str = ""
+    beat_strength: float = 1.0       # 本段起点所在拍点的强度 0~1（重拍/弱拍分级）
 
 
 @dataclass
@@ -269,6 +302,23 @@ def build_half_beats(beat_times):
     return np.asarray(half, dtype=float)
 
 
+def strength_at(beat_grid, t):
+    """时间 t 处最近整拍的强度（0~1）；无拍点时返回 1.0。"""
+    beats = beat_grid.beats
+    if beats.size == 0:
+        return 1.0
+    return float(beat_grid.strengths[int(np.argmin(np.abs(beats - t)))])
+
+
+def strength_scale(strength):
+    """把拍点强度 0~1 映射为特效强度倍率。
+
+    0.5（中等/无信息）-> 1.0 倍，即与未引入分级时完全一致；越接近 1（重拍）越强，
+    越接近 0（弱拍）越弱，倍率区间 [1-CONTRAST, 1+CONTRAST]。
+    """
+    return 1.0 + (float(np.clip(strength, 0.0, 1.0)) - 0.5) * (2.0 * STRENGTH_CONTRAST)
+
+
 def detect_beats(audio_path, start_time=0, duration=None, fallback_bpm=SYNTH_FALLBACK_BPM):
     """检测拍点，返回 BeatGrid。
 
@@ -289,16 +339,30 @@ def detect_beats(audio_path, start_time=0, duration=None, fallback_bpm=SYNTH_FAL
         librosa.frames_to_time(beat_frames, sr=sr)
     ).astype(float).flatten()
 
+    # 拍点强度（onset 强度包络在拍点处的取值）——用于区分重拍/弱拍
+    strengths = None
+    if beat_frames.size:
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        if onset_env.size:
+            strengths = onset_env[
+                np.clip(np.asarray(beat_frames, dtype=int), 0, onset_env.size - 1)
+            ].flatten()
+
     status = "ok"
     if beat_times.size < 2 or not np.isfinite(tempo) or tempo <= 1.0:
         status = "few_beats_synthesized"
         tempo = fallback_bpm
         beat_times = np.arange(0.0, max(win, 0.0), 60.0 / tempo)
+        strengths = None
         print(f"  警告: 未检测到可靠拍点，回退到 {tempo:.0f}BPM 合成网格（{beat_times.size} 个拍点）")
     else:
         print(f"  BPM: {tempo:.1f}, 整拍: {beat_times.size} 个")
 
-    return BeatGrid(beat_times, build_half_beats(beat_times), tempo, status)
+    grid = BeatGrid(beat_times, build_half_beats(beat_times), tempo, status, strengths)
+    if status == "ok" and strengths is not None:
+        s = grid.strengths
+        print(f"  拍点强度: {s.min():.2f}~{s.max():.2f}（用于重拍/弱拍分级）")
+    return grid
 
 
 def select_audio_segment(audio_path, duration=10.0, fallback_bpm=SYNTH_FALLBACK_BPM, verbose=True):
@@ -773,7 +837,7 @@ def _wrap_offset(clip):
 def plan_segments(boundaries, clip_assign, video_clips,
                   beat_dur, clip_names=None, min_shot=MIN_SHOT,
                   min_speed=MIN_SPEED, max_speed=MAX_SPEED,
-                  allow_reuse=None, transition=None):
+                  allow_reuse=None, transition=None, seg_strengths=None):
     """生成分段计划：每段的源入点/出点/倍速/时间轴区间。
 
     allow_reuse=None 时由 SHORT_SEGMENT_STRATEGY 决定（loop=复用 / error=报错）。
@@ -846,6 +910,8 @@ def plan_segments(boundaries, clip_assign, video_clips,
             reused=reused,
             transition=("cut" if is_fast or transition == "cut" else transition),
             note=note,
+            beat_strength=(float(seg_strengths[i]) if seg_strengths is not None
+                           and i < len(seg_strengths) else 1.0),
         )
         positions[ci] = pos + source_dur
         timeline_cursor = seg.timeline_end
@@ -954,8 +1020,12 @@ def add_flare(img, intensity):
     return np.clip(img.astype(np.float32) + off, 0, 255).astype(np.uint8)
 
 
-def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
+def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur,
+                beat_strengths=None):
     """逐帧特效。beat_dur 由真实 tempo 求得（P0-6），不再硬编码 172.3BPM。
+
+    beat_strengths 与 beat_times 一一对应（0~1），用于「区分重拍/弱拍」：
+    特效强度按最近拍点的强度缩放（重拍更冲、弱拍更含蓄），不传则按 1.0 处理。
 
     性能（720x960 单帧实测约 238ms -> 约 140ms）：
     - 与强度无关的几何量按尺寸预计算并缓存：暗角遮罩、鱼眼几何、光晕高斯核
@@ -1015,11 +1085,22 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
         f = frame.astype(np.float32)
         global_t = seg_start_time + t
 
-        # 节拍信息
-        nearest_beat_dist = np.min(np.abs(beat_times - global_t))
+        # 节拍信息（fr 与最近拍点：距离 + 强度）
+        have_beats = beat_times.size > 0
+        if have_beats:
+            dists = np.abs(beat_times - global_t)
+            bi = int(np.argmin(dists))
+            nearest_beat_dist = float(dists[bi])
+        else:
+            bi, nearest_beat_dist = -1, 1e9
         is_near_beat = nearest_beat_dist < beat_dur_local * 0.3
-        pulse_phase = (nearest_beat_dist / beat_dur_local) * np.pi
-        pulse_amount = np.cos(pulse_phase) * 0.5 + 0.5
+        pulse_amount = (np.cos((nearest_beat_dist / beat_dur_local) * np.pi) * 0.5 + 0.5
+                        if have_beats else 0.0)
+        # 区分重拍/弱拍：最近的拍点越强，本帧特效越冲
+        fx_scale = 1.0
+        if (beat_strengths is not None and bi >= 0
+                and beat_strengths.size == beat_times.size):
+            fx_scale = strength_scale(beat_strengths[bi])
 
         fh, fw = f.shape[:2]
 
@@ -1033,7 +1114,7 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
 
         shake_x = shake_y = 0.0
         if is_fast and is_near_beat:
-            strength = SHAKE_INTENSITY * (1 - nearest_beat_dist / (beat_dur_local * 0.3))
+            strength = SHAKE_INTENSITY * fx_scale * (1 - nearest_beat_dist / (beat_dur_local * 0.3))
             angle = rng.uniform(0, 2 * np.pi)
             shake_x = np.cos(angle) * strength
             shake_y = np.sin(angle) * strength
@@ -1053,17 +1134,17 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
 
         # ===== 2. 鱼眼脉冲（复用缓存的几何项；uint8 惰性转换）=====
         if FISHEYE_ON and pulse_amount > 0.3:
-            fe_str = pulse_amount * 0.12
+            fe_str = pulse_amount * 0.12 * fx_scale
             f = fisheye_apply(to_uint8(f), fe_str, get_fisheye_geom(fh, fw)).astype(np.float32)
 
-        # ===== 3. 像素化故障 =====
-        if PIXEL_ON and is_fast and rng.random() < 0.15:
+        # ===== 3. 像素化故障（重拍更容易触发）=====
+        if PIXEL_ON and is_fast and rng.random() < 0.15 * fx_scale:
             block = rng.randint(6, 15)
             f = pixelate(to_uint8(f), block).astype(np.float32)
 
         # ===== 4. Glitch色差 =====
         if is_fast and is_near_beat:
-            ga = GLITCH_INTENSITY * (1 - nearest_beat_dist / (beat_dur_local * 0.3))
+            ga = GLITCH_INTENSITY * fx_scale * (1 - nearest_beat_dist / (beat_dur_local * 0.3))
             if ga > 0.5:
                 off = int(ga)
                 f[:, :, 0] = np.roll(f[:, :, 0], -off, axis=1)
@@ -1073,7 +1154,7 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
 
         # ===== 5. 色相偏移 =====
         if is_fast:
-            hs = HUE_SHIFT_AMOUNT * pulse_amount * (1 if seg_index % 2 == 0 else -1)
+            hs = HUE_SHIFT_AMOUNT * pulse_amount * fx_scale * (1 if seg_index % 2 == 0 else -1)
             if abs(hs) > 1.0:
                 sr = np.radians(hs)
                 cr = np.cos(sr)
@@ -1114,10 +1195,10 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
         for c in range(3):
             f[:, :, c] = gray + (f[:, :, c] - gray) * FILTER_SATURATION
 
-        # ===== 8. 镜头光晕（复用缓存的单位强度基，强度仅做标量乘）=====
+        # ===== 8. 镜头光晕（复用缓存的单位强度基，强度仅做标量乘；重拍更强）=====
         if FLARE_ON and pulse_amount > 0.5:
             ch, cw = f.shape[:2]
-            np.add(f, get_flare_base(ch, cw) * (pulse_amount * 0.6), out=f)
+            np.add(f, get_flare_base(ch, cw) * (pulse_amount * 0.6 * fx_scale), out=f)
             np.clip(f, 0, 255, out=f)
 
         # ===== 9. 胶片颗粒（预生成基准 + 逐帧随机窗口切片，原地叠加）=====
@@ -1175,7 +1256,7 @@ def render_segments(segments, video_clips, beat_grid):
         # P0-2 修复：with_speed_scaled(speed) 使结果时长 = 源时长 / speed
         sped = sub.with_speed_scaled(seg.speed)
         fx = add_effects(sped, seg.timeline_start, beat_grid.beats,
-                         seg.index, seg.is_fast, beat_dur)
+                         seg.index, seg.is_fast, beat_dur, beat_grid.strengths)
         # 转场：dip 只作用于非快切片段，淡入淡出黑场不改变片段时长（时序安全）
         if seg.transition == "dip":
             fade = min(TRANSITION_DUR, max(0.0, seg.duration / 3.0))
@@ -1357,11 +1438,18 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
                                demands=demands, capacities=capacities)
     segments, issues = plan_segments(boundaries, clip_assign, video_clips,
                                      beat_grid.beat_duration, clip_names=clip_names,
-                                     transition=TRANSITION_MODE)
+                                     transition=TRANSITION_MODE,
+                                     seg_strengths=[strength_at(beat_grid, b) for b in boundaries])
     for msg in issues:
         print(f"  警告: {msg}")
     status["messages"].extend(issues)
     apply_labels(segments, seg_labels)
+
+    if verbose and segments:
+        strong = sum(1 for s in segments if s.beat_strength >= 0.65)
+        weak = sum(1 for s in segments if s.beat_strength <= 0.35)
+        print(f"  重拍/弱拍分级: 重拍段 {strong} 个 / 弱拍段 {weak} 个 "
+              f"(拍点强度 {beat_grid.strengths.min():.2f}~{beat_grid.strengths.max():.2f})")
 
     audio_info = {
         "path": os.path.basename(audio_path),

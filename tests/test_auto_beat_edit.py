@@ -10,7 +10,7 @@ import sys
 import numpy as np
 import pytest
 import soundfile as sf
-from moviepy import ColorClip, ImageSequenceClip
+from moviepy import ColorClip, ImageSequenceClip, VideoFileClip
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -596,6 +596,101 @@ def test_add_effects_preserves_frame_size_and_dtype(monkeypatch):
             assert frame.shape == (128, 96, 3), frame.shape
             assert frame.dtype == np.uint8
             fx.close()
+    clip.close()
+
+
+# ==========================================================================
+# 重拍/弱拍强度分级（P1 第二项「区分不同强度节拍」）
+# ==========================================================================
+def test_normalize_strengths_uniform_stays_neutral():
+    """强弱差异过小时统一记 0.5（中等），避免把噪声放大成虚假重拍。"""
+    assert np.allclose(abe._normalize_strengths(np.full(8, 3.7)), 0.5)
+    assert np.allclose(abe._normalize_strengths(np.array([])), np.array([]))
+
+
+def test_normalize_strengths_spreads_variation_to_unit_range():
+    raw = np.array([10.0, 10.1, 10.2, 40.0, 90.0, 95.0])
+    s = abe._normalize_strengths(raw)
+    assert s.min() == pytest.approx(0.0) and s.max() == pytest.approx(1.0)
+    assert (np.diff(s[np.argsort(raw)]) >= -1e-9).all()      # 单调
+
+
+def test_beatgrid_strengths_default_to_neutral():
+    grid = abe.BeatGrid(beats=np.arange(4.0), half_beats=np.arange(4.0), tempo=120.0)
+    assert np.allclose(grid.strengths, 0.5)
+    # 长度不匹配时也不能错位，退回中性
+    bad = abe.BeatGrid(beats=np.arange(4.0), half_beats=np.arange(4.0), tempo=120.0,
+                       strengths=np.array([1.0, 2.0]))
+    assert np.allclose(bad.strengths, 0.5)
+
+
+def test_strength_scale_neutral_reproduces_old_behaviour():
+    assert abe.strength_scale(0.5) == pytest.approx(1.0)
+    assert abe.strength_scale(1.0) == pytest.approx(1.0 + abe.STRENGTH_CONTRAST)
+    assert abe.strength_scale(0.0) == pytest.approx(1.0 - abe.STRENGTH_CONTRAST)
+    assert abe.strength_scale(5.0) == abe.strength_scale(1.0)   # 越界钳制
+
+
+def test_strength_at_picks_nearest_beat():
+    grid = abe.BeatGrid(beats=np.array([0.0, 1.0, 2.0]),
+                        half_beats=np.array([0.5, 1.5]), tempo=60.0,
+                        strengths=np.array([0.1, 0.9, 0.4]))
+    # 取最近拍点的强度（值本身会被归一化，故与 grid.strengths 对齐比较）
+    assert abe.strength_at(grid, 0.9) == pytest.approx(grid.strengths[1])
+    assert abe.strength_at(grid, 2.4) == pytest.approx(grid.strengths[2])
+    assert grid.strengths[1] > grid.strengths[2]        # 原始强弱关系保留
+    empty = abe.BeatGrid(beats=np.array([]), half_beats=np.array([]), tempo=120.0)
+    assert abe.strength_at(empty, 1.0) == 1.0
+
+
+def test_detect_beats_returns_strengths_aligned(click_audio):
+    grid = abe.detect_beats(click_audio, 0, None)
+    assert grid.strengths.size == grid.beats.size
+    assert grid.strengths.min() >= 0.0 and grid.strengths.max() <= 1.0
+
+
+def test_plan_segments_records_beat_strength(tiny_videos):
+    folder, files = tiny_videos
+    clips, names, _ = abe.prepare_video_clips(files, None)
+    boundaries = [0.0, 0.5, 1.0, 1.5]
+    assign = [0, 1, 2]
+    segs, _ = abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names,
+                                seg_strengths=[0.2, 0.9, 0.5])
+    assert [s.beat_strength for s in segs] == pytest.approx([0.2, 0.9, 0.5])
+    # 未提供时不报错，按中性 1.0 处理
+    segs2, _ = abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names)
+    assert all(s.beat_strength == 1.0 for s in segs2)
+    for c in clips:
+        c.close()
+
+
+def _noise_clip(path, size=(64, 80), fps=12, n=14):
+    rng = np.random.RandomState(5)
+    frames = [rng.randint(0, 255, (size[1], size[0], 3)).astype(np.uint8) for _ in range(n)]
+    c = ImageSequenceClip(frames, fps=fps)
+    c.write_videofile(str(path), fps=fps, codec="libx264", audio=False, logger=None)
+    c.close()
+
+
+def test_add_effects_scales_with_beat_strength(tmp_path, monkeypatch):
+    """重拍帧必须比弱拍帧「更冲」：同一帧下不同强度应产生不同像素结果。"""
+    monkeypatch.setattr(abe, "TARGET_RESOLUTION", (96, 128))
+    p = tmp_path / "noise.mp4"
+    _noise_clip(str(p))
+    clip = VideoFileClip(str(p))
+    beats = np.array([0.0, 0.5, 1.0])
+    weak = abe.add_effects(clip, 0.0, beats, 0, True, 0.5,
+                           np.array([0.0, 0.5, 0.5])).get_frame(0.0)
+    neutral = abe.add_effects(clip, 0.0, beats, 0, True, 0.5,
+                              np.array([0.5, 0.5, 0.5])).get_frame(0.0)
+    strong = abe.add_effects(clip, 0.0, beats, 0, True, 0.5,
+                             np.array([1.0, 0.5, 0.5])).get_frame(0.0)
+    for fr in (weak, neutral, strong):
+        assert fr.shape == (128, 96, 3) and fr.dtype == np.uint8
+    assert np.abs(strong.astype(int) - weak.astype(int)).mean() > 3.0
+    # 中性强度应与不传强度（旧行为）一致
+    legacy = abe.add_effects(clip, 0.0, beats, 0, True, 0.5).get_frame(0.0)
+    assert np.abs(neutral.astype(int) - legacy.astype(int)).mean() == pytest.approx(0.0, abs=1e-6)
     clip.close()
 
 
