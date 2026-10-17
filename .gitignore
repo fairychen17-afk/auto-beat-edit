@@ -6,6 +6,12 @@ __pycache__/
 .Python
 *.egg-info/
 *.egg
+.venv/
+venv/
+.pytest_cache/
+
+# 剪辑计划输出
+edit_plan.json
 
 # 输出视频
 *.mp4
