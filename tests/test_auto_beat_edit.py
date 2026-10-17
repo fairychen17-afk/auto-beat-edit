@@ -737,3 +737,106 @@ def test_dip_transition_is_timing_safe(tmp_path, monkeypatch, tiny_videos):
     for c in clips:
         c.close()
 
+
+# ==========================================================================
+# 素材内窗口优选：让质量分析真正作用于「取素材的哪一段画面」
+# ==========================================================================
+def _fake_asset(name, dur, times, scores):
+    a = abe.AssetInfo(name=name, duration=dur, width=64, height=80, aspect=0.8, has_audio=False)
+    a.window_times = list(times)
+    a.window_score = list(scores)
+    return a
+
+
+def test_window_profile_marks_black_head_as_low_score():
+    """片头黑帧必须拿低分：清晰度/运动量/曝光都接近 0。"""
+    frames = [np.zeros((32, 24, 3), dtype=np.uint8) for _ in range(6)]
+    rng = np.random.RandomState(1)
+    base = rng.randint(0, 255, (32, 24, 3)).astype(np.uint8)
+    frames += [np.roll(base, i * 5, axis=1) for i in range(6)]
+    clip = ImageSequenceClip(frames, fps=12)
+    times, scores = abe._window_profile(clip, n=12)
+    assert len(times) == len(scores) == 12
+    half = len(scores) // 2
+    assert max(scores[:half]) < max(scores[half:])
+    clip.close()
+
+
+def test_window_profile_empty_for_zero_duration():
+    assert abe._window_profile(ColorClip(size=(8, 8), color=(0, 0, 0), duration=0.0)) == ([], [])
+
+
+def test_choose_window_start_skips_edge_guard():
+    a = _fake_asset("a.mp4", 4.0, [0.0, 1.5], [1.0, 0.3])
+    start, score = abe.choose_window_start(a, 4.0, 1.0, [], 0.0)
+    assert start == pytest.approx(1.5)          # 0.0 落在片头保护区内被排除
+    assert score is not None
+
+
+def test_choose_window_start_penalises_used_windows():
+    a = _fake_asset("a.mp4", 4.0, [0.5, 1.5, 2.5], [0.9, 0.85, 0.2])
+    first, _ = abe.choose_window_start(a, 4.0, 1.0, [], 0.0)
+    assert first == pytest.approx(0.5)
+    second, _ = abe.choose_window_start(a, 4.0, 1.0, [(0.5, 1.5)], 0.0)
+    assert second == pytest.approx(1.5)         # 0.5 被重叠扣分挤掉
+
+
+def test_choose_window_start_falls_back_when_nothing_fits():
+    a = _fake_asset("a.mp4", 2.0, [0.1, 0.5], [0.9, 0.8])
+    start, score = abe.choose_window_start(a, 2.0, 3.0, [], 0.7)
+    assert start == pytest.approx(0.7) and score is None
+
+
+def test_capacity_offset_reserves_window_guard(monkeypatch):
+    clip = ColorClip(size=(8, 8), color=(0, 0, 0), duration=4.0)
+    monkeypatch.setattr(abe, "WINDOW_SELECT", True)
+    assert abe._capacity_offset(clip) == pytest.approx(abe.WINDOW_EDGE_GUARD)
+    monkeypatch.setattr(abe, "WINDOW_SELECT", False)
+    assert abe._capacity_offset(clip) == pytest.approx(abe._wrap_offset(clip))
+    clip.close()
+
+
+def test_plan_segments_prefers_high_scoring_window(tiny_videos):
+    folder, files = tiny_videos
+    clips, names, _ = abe.prepare_video_clips(files, None)
+    boundaries = [0.0, 0.5, 1.0]
+    assign = [0, 0]
+    asset = _fake_asset(names[0], clips[0].duration, [0.3, 1.0, 1.6], [0.2, 0.95, 0.3])
+    segs, _ = abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names,
+                                assets=[asset], window_select=True)
+    # 第一段应落到 score 最高的 1.0s，而不是顺序游标的 2% 处（≈0.04s）
+    assert segs[0].source_in == pytest.approx(1.0)
+    # 窗口优选只改源入点，不改时长：时间轴严格 0 -> 0.5 -> 1.0
+    assert [s.timeline_end for s in segs] == pytest.approx([0.5, 1.0])
+    # 关闭窗口优选时应退回原顺序游标
+    segs2, _ = abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names,
+                                 assets=[asset], window_select=False)
+    assert segs2[0].source_in < 0.1
+    for c in clips:
+        c.close()
+
+
+def test_build_edit_plan_window_select_keeps_edl_valid(tmp_path, monkeypatch, tiny_videos):
+    folder, files = tiny_videos
+    synth_click_track(os.path.join(folder, "track.wav"), total=12.0,
+                      bpm=120.0, active=(0.0, 12.0))
+    monkeypatch.setattr(abe, "TARGET_RESOLUTION", (96, 128))
+    plan, clips, grid, _ = abe.build_edit_plan(
+        folder=folder, audio_file="track.wav", duration=3.0,
+        audio_start=1.0, auto_select=False,
+        clip_order=["1.mp4", "2.mp4", "10.mp4"],
+        target_resolution=(96, 128), verbose=False,
+    )
+    problems, critical = abe.validate_edl(plan["edl"])
+    assert critical == [] and problems == []
+    durs = plan["edl"]["clip_durations"]
+    for s in plan["edl"]["segments"]:
+        assert s["source_in"] >= 0.0
+        assert s["source_out"] <= durs[s["clip_name"]] + 0.05
+    # 每个素材都产出了候选窗口分（用于素材内优选）
+    assert any(a["window_score"] for a in plan["assets"])
+    for a in plan["assets"]:
+        assert a["window_score"] is None or len(a["window_score"]) in (0, abe.WINDOW_CANDIDATES)
+    for c in clips:
+        c.close()
+

@@ -65,6 +65,14 @@ PREFER_QUALITY = True
 QUALITY_SAMPLE_FRAMES = 5          # 每个素材采样多少帧做质量评估
 QUALITY_MIN_WARN = 0.3            # 低于该质量分的素材给出提示
 
+# 素材内窗口优选：同一个素材里挑「更锐利 / 更有运动 / 曝光更健康」的时间窗口，
+# 避开片头片尾的黑帧、淡入淡出与长时间静止段——让素材质量分析真正作用于
+# 「取素材的哪一段画面」，而不只是决定「镜头分给谁」。
+WINDOW_SELECT = True               # 是否启用素材内窗口优选
+WINDOW_CANDIDATES = 12             # 每个素材内部均匀采样的候选窗口起点数
+WINDOW_EDGE_GUARD = 0.15           # 片头/片尾保护时长（秒），避开黑帧与淡入淡出
+WINDOW_OVERLAP_PENALTY = 0.6       # 与已用时间区域重叠时的扣分系数（保证画面不重复）
+
 # 转场：cut 硬切（默认，卡点最准）/ dip 长片段淡入淡出黑场（时序安全，不改总时长）
 TRANSITION_MODE = "cut"
 TRANSITION_DUR = 0.12              # dip 模式下的淡入淡出时长（秒）
@@ -127,7 +135,7 @@ class BeatGrid:
     """音乐拍点分析结果。
 
     strengths 与 beats 一一对应，是每个整拍的「强度」0~1（相对值，来自 onset 强度包络），
-    用于区分重拍/弱拍、让特效强度跟着音乐走；无可靠强度信息时统一记为 1.0。
+    用于区分重拍/弱拍、让特效强度跟着音乐走；无可靠强度信息时统一记为 0.5（中等）。
     """
     beats: np.ndarray
     half_beats: np.ndarray
@@ -192,6 +200,8 @@ class AssetInfo:
     motion: float = 0.0              # 归一化运动量
     quality_score: float = 0.0       # 归一化综合质量 0~1
     candidate_score: float = 0.0     # 候选评分 = 时长可用度 + 质量
+    window_times: list = None        # 素材内候选窗口起点（秒），用于窗口优选
+    window_score: list = None        # 各候选窗口的本地综合分 0~1（素材内归一化）
     note: str = ""
 
 
@@ -578,6 +588,38 @@ def _sample_gray_frames(clip, n=QUALITY_SAMPLE_FRAMES, step=4):
     return out
 
 
+def _window_profile(clip, n=WINDOW_CANDIDATES, step=4):
+    """在素材内部均匀采样 n 帧，给每个时间点算一个「画面值得放吗」的分（素材内归一化）。
+
+    返回 (times, scores)：
+      times  —— 候选窗口起点（秒）
+      scores —— 0~1 本地综合分（清晰度 0.5 / 运动量 0.3 / 曝光 0.2）
+    片头片尾的黑帧、淡入淡出与长时间静止段会因为清晰度/运动量低而自然得低分，
+    这样 plan_segments 就能在同一素材内挑更值得放的时间窗口。
+    """
+    dur = float(clip.duration or 0.0)
+    if dur <= 0.0 or n <= 1:
+        return [], []
+    times = np.linspace(0.0, max(0.0, dur - 1e-3), n)
+    grays = []
+    for t in times:
+        try:
+            grays.append(_to_gray(clip.get_frame(float(t)))[::step, ::step])
+        except Exception:  # noqa: BLE001 - 单帧读取失败不该中断整个分析
+            grays.append(None)
+    if all(g is None for g in grays):
+        return [], []
+    sharp = np.array([0.0 if g is None else _laplacian_variance(g) for g in grays])
+    expo = np.array([0.0 if g is None else _exposure_score(g) for g in grays])
+    motion = np.zeros(len(grays))
+    for i in range(1, len(grays)):
+        a, b = grays[i - 1], grays[i]
+        if a is not None and b is not None and a.shape == b.shape:
+            motion[i] = float(np.mean(np.abs(b - a)) / 255.0)
+    score = 0.5 * _minmax(sharp) + 0.3 * _minmax(motion) + 0.2 * expo
+    return [float(t) for t in times], [float(s) for s in score]
+
+
 def _minmax(values):
     v = np.asarray(values, dtype=float)
     if v.size == 0:
@@ -639,6 +681,7 @@ def analyze_assets(video_files, target_duration=0.0, sample_frames=QUALITY_SAMPL
                         np.mean(np.abs(grays[i + 1] - grays[i])) / 255.0
                         for i in range(len(grays) - 1)
                     ]))
+            info.window_times, info.window_score = _window_profile(clip)
         except Exception as exc:  # noqa: BLE001
             info.note = f"帧采样失败: {exc}"
         clip.close()
@@ -834,13 +877,76 @@ def _wrap_offset(clip):
     return min(clip.duration * 0.02, max(0.0, clip.duration - 1e-3))
 
 
+def _window_guard(clip_duration):
+    """窗口优选的片头/片尾保护时长；素材很短时按 10% 比例收缩。"""
+    return min(WINDOW_EDGE_GUARD, max(0.0, float(clip_duration)) * 0.1)
+
+
+def _capacity_offset(clip):
+    """可用时长的起点偏移：窗口优选时预留片头保护，否则沿用 2% 回绕点。
+
+    必须与 choose_window_start 的候选过滤口径一致，否则 assign_clips 会以为某素材
+    「够长」而把长片段分给它，实际窗口取不到那么长的画面，又退回 footage_short。
+    """
+    if WINDOW_SELECT:
+        return _window_guard(clip.duration)
+    return _wrap_offset(clip)
+
+
+def _overlaps(a, b, ranges, tol=1e-6):
+    """[a, b) 是否与已用的任意时间区域重叠。"""
+    for s, e in ranges:
+        if min(e, b) - max(s, a) > tol:
+            return True
+    return False
+
+
+def choose_window_start(asset, clip_dur, need_src, used_ranges, default_pos,
+                        edge_guard=WINDOW_EDGE_GUARD,
+                        penalty=WINDOW_OVERLAP_PENALTY):
+    """在素材内部挑一个「画面更好且不与已用区域重叠」的窗口起点。
+
+    - 只考虑能容纳 need_src 的起点（避免 footage_short 造成总时长漂移）
+    - 跳过片头/片尾保护区（黑帧、淡入淡出、静止段）
+    - 与已用时间区域重叠的部分按比例扣分，保证画面多样、不反复放同一段
+
+    返回 (start, score)；没有合格候选时返回 (float(default_pos), None)。
+    """
+    times = getattr(asset, "window_times", None) or []
+    scores = getattr(asset, "window_score", None) or []
+    if not times or len(times) != len(scores):
+        return float(default_pos), None
+    guard = min(edge_guard, max(0.0, clip_dur) * 0.1)
+    best, best_val = None, -1e9
+    for t, sc in zip(times, scores):
+        t = float(t)
+        if t < guard - 1e-9 or t + need_src > clip_dur + 1e-6:
+            continue
+        overlap = 0.0
+        for s, e in used_ranges:
+            ov = min(e, t + need_src) - max(s, t)
+            if ov > 0:
+                overlap += ov
+        val = float(sc) - penalty * (overlap / max(need_src, 1e-6))
+        if val > best_val + 1e-9:
+            best_val, best = val, t
+    if best is None:
+        return float(default_pos), None
+    return best, best_val
+
+
 def plan_segments(boundaries, clip_assign, video_clips,
                   beat_dur, clip_names=None, min_shot=MIN_SHOT,
                   min_speed=MIN_SPEED, max_speed=MAX_SPEED,
-                  allow_reuse=None, transition=None, seg_strengths=None):
+                  allow_reuse=None, transition=None, seg_strengths=None,
+                  assets=None, window_select=None, verbose=False):
     """生成分段计划：每段的源入点/出点/倍速/时间轴区间。
 
     allow_reuse=None 时由 SHORT_SEGMENT_STRATEGY 决定（loop=复用 / error=报错）。
+
+    assets / window_select：给了素材分析结果（含 window_times/window_score）且开启
+    窗口优选时，每段的源入点不再机械地顺序切片，而是在该素材内部挑一个「画面更好
+    且不与已用区域重叠」的窗口；挑不到合格窗口时退回原来的顺序游标逻辑。
     """
     if allow_reuse is None:
         if SHORT_SEGMENT_STRATEGY not in ("loop", "error"):
@@ -850,10 +956,17 @@ def plan_segments(boundaries, clip_assign, video_clips,
         allow_reuse = (SHORT_SEGMENT_STRATEGY != "error")
     if transition is None:
         transition = TRANSITION_MODE
+    if window_select is None:
+        window_select = WINDOW_SELECT
     n_segs = len(boundaries) - 1
     if clip_names is None:
         clip_names = [f"clip{i}" for i in range(len(video_clips))]
+    asset_by_name = {}
+    if assets:
+        asset_by_name = {getattr(a, "name", None): a for a in assets}
     positions = [_wrap_offset(c) for c in video_clips]
+    used_ranges = {i: [] for i in range(len(video_clips))}
+    window_picked = 0
     segments = []
     timeline_cursor = 0.0
     issues = []
@@ -876,6 +989,17 @@ def plan_segments(boundaries, clip_assign, video_clips,
                 )
             pos = _wrap_offset(clip)
             reused = True
+
+        # 素材内窗口优选：在本素材里挑画面更好的时间窗口（避开黑帧/静止段、保证不重复）
+        asset = asset_by_name.get(clip_names[ci]) if window_select else None
+        if asset is not None:
+            need = target * min_speed
+            cand, _score = choose_window_start(asset, clip.duration, need, used_ranges[ci], pos)
+            if abs(cand - pos) > 1e-6:
+                pos = cand
+                window_picked += 1
+                if _overlaps(pos, pos + need, used_ranges[ci]):
+                    reused = True
 
         avail = clip.duration - pos
         desired = min(AVG_SPEED_BASE + (i % 5) * AVG_SPEED_STEP, max_speed)
@@ -913,10 +1037,15 @@ def plan_segments(boundaries, clip_assign, video_clips,
             beat_strength=(float(seg_strengths[i]) if seg_strengths is not None
                            and i < len(seg_strengths) else 1.0),
         )
-        positions[ci] = pos + source_dur
+        used_ranges[ci].append((pos, pos + source_dur))
+        # 顺序游标只前进（窗口优选往回取也不会让「素材用尽」的兜底逻辑失效）
+        positions[ci] = max(positions[ci], pos + source_dur)
         timeline_cursor = seg.timeline_end
         segments.append(seg)
 
+    if verbose and window_select and window_picked:
+        print(f"  素材内窗口优选: {window_picked}/{len(segments)} 段改用素材内部高分窗口"
+              f"（避开片头片尾黑帧与静止段）")
     return segments, issues
 
 
@@ -1416,9 +1545,11 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
         print("\n素材质量评估（相对候选评分）:")
         for a in assets:
             flag = "  ⚠低分" if a.quality_score < QUALITY_MIN_WARN else ""
+            ws = a.window_score or []
+            wtxt = f" 窗口 {min(ws):.2f}~{max(ws):.2f}" if ws else ""
             print(f"  {a.name}: 质量 {a.quality_score:.2f} "
                   f"(清晰度 {a.sharpness:.2f} / 运动 {a.motion:.2f} / 曝光 {a.exposure_score:.2f}) "
-                  f"候选 {a.candidate_score:.2f}{flag}")
+                  f"候选 {a.candidate_score:.2f}{flag}{wtxt}")
     low = [a.name for a in assets if a.quality_score < QUALITY_MIN_WARN and a.width]
     if len(assets) > 1 and len(low) == len(assets):
         status["messages"].append("所有素材质量分都偏低（可能模糊/欠曝/过曝），建议更换素材")
@@ -1433,13 +1564,15 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
     # 每段需要的「源素材时长」（时间轴时长 × 最慢速）与每个素材的可用时长，
     # 用于把长片段分给足够长的素材，避免 footage_short 造成总时长漂移。
     demands = [boundaries[i + 1] - boundaries[i] for i in range(n_segs)]
-    capacities = [clip.duration - _wrap_offset(clip) for clip in video_clips]
+    capacities = [clip.duration - _capacity_offset(clip) for clip in video_clips]
     clip_assign = assign_clips(n_segs, len(video_clips), weights,
                                demands=demands, capacities=capacities)
     segments, issues = plan_segments(boundaries, clip_assign, video_clips,
                                      beat_grid.beat_duration, clip_names=clip_names,
                                      transition=TRANSITION_MODE,
-                                     seg_strengths=[strength_at(beat_grid, b) for b in boundaries])
+                                     seg_strengths=[strength_at(beat_grid, b) for b in boundaries],
+                                     assets=assets, window_select=WINDOW_SELECT,
+                                     verbose=verbose)
     for msg in issues:
         print(f"  警告: {msg}")
     status["messages"].extend(issues)
