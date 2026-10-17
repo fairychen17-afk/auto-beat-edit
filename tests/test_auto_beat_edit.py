@@ -249,6 +249,18 @@ def test_assign_clips_single_clip_ok():
         abe.assign_clips(5, 0)
 
 
+def test_assign_clips_skips_clip_with_insufficient_footage():
+    """长片段不能被分给过短的素材，否则会 footage_short、成片总时长漂移。"""
+    # 可用时长 1.343 / 3.097 / 4.645 / 3.205；首段需要 2.11s
+    demands = [2.11, 0.35, 0.35, 0.35]
+    capacities = [1.343, 3.097, 4.645, 3.205]
+    seq = abe.assign_clips(4, 4, demands=demands, capacities=capacities)
+    assert capacities[seq[0]] >= demands[0] * abe.MIN_SPEED - 1e-9, seq
+    assert seq[0] != 0, seq          # 1.343s 的素材填不满 2.11s
+    # 未提供约束时行为不变（纯权重轮转）
+    assert abe.assign_clips(4, 4) == abe.assign_clips(4, 4, demands=None, capacities=None)
+
+
 def test_plan_segments_single_clip_no_indexerror(tiny_videos):
     """原版在素材少于 4 个时会 IndexError，这里必须安全。"""
     folder, files = tiny_videos
@@ -288,6 +300,70 @@ def test_plan_segments_reuse_or_error(tiny_videos):
 # ==========================================================================
 # EDL 与校验（P2 第六项）
 # ==========================================================================
+def test_build_boundaries_degrades_half_beat_when_below_min_shot():
+    """半拍短于 MIN_SHOT 时必须降级为整拍，切点全部落在整拍网格上。
+
+    240BPM 半拍 = 0.125s < MIN_SHOT 0.15s（否则会出现低于最短镜头约束的切点）。
+    """
+    bpm = 240.0
+    bd = 60.0 / bpm
+    beats = np.arange(0.0, 9.6, bd)                       # 末尾刻意早于窗口结束
+    grid = abe.BeatGrid(beats=beats, half_beats=abe.build_half_beats(beats), tempo=bpm)
+    labels = []
+    boundaries = abe.build_boundaries(grid, 10.0, abe.PATTERN_PRESETS["normal"],
+                                      verbose=False, label_sink=labels)
+
+    durs = np.diff(boundaries)
+    assert (durs >= abe.MIN_SHOT - 1e-6).all(), durs
+    assert len(labels) == len(boundaries) - 1
+    # 降级后不应出现半拍级别（0.125s）的切点
+    assert (durs < bd - 1e-6).sum() == 0, durs
+    # 标签必须真实：长片段的标签不应是「闪 / 快切」
+    for d, lb in zip(durs, labels):
+        if d > 1.0:
+            assert "闪" not in lb and "快切" not in lb, (d, lb)
+    # 网格补齐后总时长应贴近目标（容差 0.2s）
+    assert abs(boundaries[-1] - 10.0) < 0.2, boundaries[-1]
+    # 每个切点都落在拍点网格上（含按 tempo 补齐的末端网格）
+    full_grid = np.concatenate([beats, np.arange(beats[-1] + bd, 10.0 + bd, bd)])
+    for b in boundaries[1:]:
+        assert np.min(np.abs(full_grid - b)) < 0.06, b
+
+
+def test_build_boundaries_uses_half_beats_at_172bpm_without_collapsing_longs():
+    """172.3BPM 半拍 ≈ 0.174s ≥ MIN_SHOT，必须真正使用半拍快切，且长镜头不塌缩。
+
+    复现真实素材问题：MIN_SHOT=0.25 时半拍被判过短、整体降级为整拍，快切段被
+    拉长、结尾长镜头被挤到只剩 1 拍（实测「结尾长」由 1.59s 塌缩为 0.35s）。
+    """
+    bpm = 172.3
+    bd = 60.0 / bpm
+    beats = np.arange(0.0, 9.6, bd)
+    grid = abe.BeatGrid(beats=beats, half_beats=abe.build_half_beats(beats), tempo=bpm)
+    labels = []
+    boundaries = abe.build_boundaries(grid, 10.0, abe.PATTERN_PRESETS["normal"],
+                                      verbose=False, label_sink=labels)
+
+    durs = np.diff(boundaries)
+    assert (durs >= abe.MIN_SHOT - 1e-6).all(), durs
+    # 必须存在半拍级别的快切（而不是整体降级为整拍）
+    assert (durs < bd - 1e-6).sum() >= 5, durs
+    # 「结尾长」不能被挤塌缩成 1 拍
+    long_tail = [d for d, lb in zip(durs, labels) if lb == "结尾长"]
+    assert long_tail and max(long_tail) > 1.0, list(zip([round(d, 3) for d in durs], labels))
+    assert abs(boundaries[-1] - 10.0) < 0.2, boundaries[-1]
+
+
+def test_build_boundaries_keeps_half_beats_at_moderate_tempo():
+    """120BPM 半拍=0.25s 恰好满足 MIN_SHOT，不应降级。"""
+    grid = abe.BeatGrid(beats=np.arange(0.0, 10.0, 0.5),
+                        half_beats=np.arange(0.0, 10.0, 0.25), tempo=120.0)
+    boundaries = abe.build_boundaries(grid, 8.0, abe.PATTERN_PRESETS["normal"], verbose=False)
+    durs = np.diff(boundaries)
+    assert (durs >= abe.MIN_SHOT - 1e-6).all()
+    assert (durs < 0.5 - 1e-6).any()          # 存在半拍（0.25s）级别的快切
+
+
 def test_edl_timeline_is_contiguous_and_valid(tiny_videos):
     folder, files = tiny_videos
     clips, names, _ = abe.prepare_video_clips(files, target_resolution=None)
@@ -296,7 +372,7 @@ def test_edl_timeline_is_contiguous_and_valid(tiny_videos):
     boundaries = abe.build_boundaries(grid, 3.0, abe.PATTERN_PRESETS["normal"], verbose=False)
     assign = abe.assign_clips(len(boundaries) - 1, len(clips))
     segs, _ = abe.plan_segments(boundaries, assign, clips, grid.beat_duration, clip_names=names)
-    abe.apply_labels(segs, abe.PATTERN_PRESETS["normal"])
+    abe.apply_labels(segs, [p[1] for p in abe.PATTERN_PRESETS["normal"]])
     durations = {n: c.duration for n, c in zip(names, clips)}
     edl = abe.build_edl(segs, {"start": 0.0, "duration": 3.0}, durations,
                         target_resolution=(64, 80), target_duration=3.0)

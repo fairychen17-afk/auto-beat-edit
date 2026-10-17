@@ -52,7 +52,11 @@ AVG_SPEED_STEP = 0.015
 
 # 剪辑策略档位：normal / slow / fast
 EDIT_STRATEGY = "normal"
-MIN_SHOT = 0.25                    # 最短镜头长度，低于该值的切点会被跳过
+# 最短镜头长度（秒）：低于该值的切点会被跳过。
+# 取 0.15 是为了容纳高 BPM 音乐的「半拍」快切：172BPM 半拍 ≈ 0.174s ≈ 5 帧。
+# 若设为 0.25，则 172BPM 的半拍会被判为过短，整个模板降级为整拍，导致快切段
+# 被拉长、结尾长镜头被挤到只剩 1 拍（实测「结尾长」由 1.59s 塌缩为 0.35s）。
+MIN_SHOT = 0.15
 # 素材不够时的策略：loop=回绕复用（默认）/ error=直接报错
 SHORT_SEGMENT_STRATEGY = "loop"
 
@@ -648,25 +652,52 @@ PATTERN_PRESETS = {
 }
 
 
-def build_boundaries(beat_grid, target_dur, pattern, min_shot=MIN_SHOT, verbose=True):
-    """根据拍点网格生成切点（时间轴时间，从 0 开始）。"""
+def build_boundaries(beat_grid, target_dur, pattern, min_shot=MIN_SHOT, verbose=True,
+                     label_sink=None):
+    """根据拍点网格生成切点（时间轴时间，从 0 开始）。
+
+    降级规则（重要）：当「半拍」间隔本身短于 min_shot 时，半拍切点在物理上
+    无法满足最短镜头约束（高 BPM 音乐常见：172BPM 的半拍仅 0.174s < 0.25s），
+    此时自动降级为整拍切点，保证「闪 / 快切」仍然发生，而不是被静默丢弃、
+    导致整段节奏结构塌陷。
+
+    label_sink 非 None 时按「实际生成的片段顺序」填入标签，避免按序号猜测标签
+    造成 EDL 标注与实际片段不符。
+    """
     beat_times, half_beats = beat_grid.beats, beat_grid.half_beats
     beat_dur = beat_grid.beat_duration
     half_beat_dur = beat_dur / 2.0
+
+    # 拍点网格可能未覆盖到窗口末端（librosa 的末尾拍点常早于区间结束）。
+    # 按 tempo 向后补齐网格，保证末端切点仍落在拍点上、成片总时长贴近目标。
+    if beat_times.size and target_dur - beat_times[-1] > 1e-6:
+        extra = np.arange(beat_times[-1] + beat_dur, target_dur + beat_dur, beat_dur)
+        beat_times = np.concatenate([beat_times, extra])
+    if half_beats.size and target_dur - half_beats[-1] > 1e-6:
+        extra = np.arange(half_beats[-1] + half_beat_dur,
+                          target_dur + half_beat_dur, half_beat_dur)
+        half_beats = np.concatenate([half_beats, extra])
+
+    half_usable = half_beat_dur >= min_shot - 1e-9
+    if not half_usable and verbose:
+        print(f"  提示: 半拍 {half_beat_dur:.3f}s 短于 MIN_SHOT {min_shot:.2f}s，"
+              f"快切自动降级为整拍 {beat_dur:.3f}s")
 
     total_pattern_beats = sum(p[0] for p in pattern) or 1.0
     total_beats = target_dur / beat_dur
     scale = total_beats / total_pattern_beats
 
     boundaries = [0.0]
+    labels = []
     cum_beats = 0.0
-    for beats, _label, snap_type in pattern:
+    for beats, label, snap_type in pattern:
         cum_beats += beats * scale
         target_time = cum_beats * beat_dur
         if target_time > target_dur + 0.2:
             break
-        grid = half_beats if snap_type == "half" else beat_times
-        base_gap = half_beat_dur if snap_type == "half" else beat_dur
+        use_half = (snap_type == "half") and half_usable
+        grid = half_beats if use_half else beat_times
+        base_gap = half_beat_dur if use_half else beat_dur
         snapped = snap_to_grid(target_time, grid,
                                boundaries[-1] + base_gap * 0.5, fallback=target_time)
         if snapped - boundaries[-1] < min_shot:
@@ -674,21 +705,32 @@ def build_boundaries(beat_grid, target_dur, pattern, min_shot=MIN_SHOT, verbose=
         if snapped > target_dur + 0.1:
             break
         boundaries.append(snapped)
+        labels.append(label)
 
     if boundaries[-1] < target_dur - 0.3:
         end_snapped = snap_to_grid(target_dur, beat_times,
                                    boundaries[-1] + beat_dur * 0.5, fallback=target_dur)
         boundaries.append(end_snapped if end_snapped <= target_dur + 0.2 else target_dur)
+        labels.append("收尾")
+
+    if label_sink is not None:
+        label_sink[:] = labels
 
     if verbose:
         print(f"  切点 {len(boundaries)} 个 / 片段 {len(boundaries) - 1} 段")
     return boundaries
 
 
-def assign_clips(n_segs, n_clips, weights=None):
+def assign_clips(n_segs, n_clips, weights=None, demands=None, capacities=None,
+                 min_speed=MIN_SPEED):
     """把片段分配给素材：按权重比例分配，且尽量不连续重复同一素材。
 
     weights=None 时等权（等价于均衡轮转）。
+
+    demands / capacities 非 None 时启用「素材够不够」约束：把质量权重排序的结果
+    再过滤成「素材可用时长 >= 本段需要的最少源时长（demands[i] * min_speed）」的
+    候选集合，从里面挑。这样才不会把 2.11s 的长片段分给只有 1.37s 的素材——
+    否则该段会 footage_short（只能用最慢速凑），成片总时长随之漂移。
     """
     if n_clips <= 0:
         raise ValueError("素材数量为 0，无法分配片段")
@@ -702,12 +744,20 @@ def assign_clips(n_segs, n_clips, weights=None):
     total_w = sum(weights)
     share = [w / total_w for w in weights]
 
+    check_fit = (demands is not None and capacities is not None
+                 and len(demands) >= n_segs and len(capacities) >= n_clips)
+
     seq, counts, last = [], [0] * n_clips, -1
     for i in range(n_segs):
         deficits = [share[c] * (i + 1) - counts[c] for c in range(n_clips)]
         order = sorted(range(n_clips), key=lambda c: (-deficits[c], c))
+        if check_fit:
+            need = float(demands[i]) * min_speed
+            fit = [c for c in order if capacities[c] + 1e-9 >= need]
+            if fit:
+                order = fit
         pick = order[0]
-        if pick == last:
+        if pick == last and len(order) > 1:
             pick = order[1]
         seq.append(pick)
         counts[pick] += 1
@@ -804,12 +854,14 @@ def plan_segments(boundaries, clip_assign, video_clips,
     return segments, issues
 
 
-def apply_labels(segments, pattern):
+def apply_labels(segments, labels):
+    """按实际片段顺序赋标签（labels 来自 build_boundaries 的 label_sink）。
+
+    不再按「序号 % 模板」猜测，避免高 BPM 下模板条目被跳过/合并时标签与实际
+    片段时长不符（例如把 2.11s 的长片段标成「短闪」）。
+    """
     for seg in segments:
-        if seg.index < len(pattern):
-            seg.label = pattern[seg.index][1]
-        else:
-            seg.label = "?"
+        seg.label = labels[seg.index] if seg.index < len(labels) else "?"
     return segments
 
 
@@ -1292,17 +1344,24 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
 
     # ---- 切点与分段 ----
     pattern = PATTERN_PRESETS.get(strategy, PATTERN_PRESETS["normal"])
-    boundaries = build_boundaries(beat_grid, duration, pattern, MIN_SHOT, verbose=verbose)
+    seg_labels = []
+    boundaries = build_boundaries(beat_grid, duration, pattern, MIN_SHOT, verbose=verbose,
+                                  label_sink=seg_labels)
     n_segs = len(boundaries) - 1
     weights = quality_weights(assets, clip_names)
-    clip_assign = assign_clips(n_segs, len(video_clips), weights)
+    # 每段需要的「源素材时长」（时间轴时长 × 最慢速）与每个素材的可用时长，
+    # 用于把长片段分给足够长的素材，避免 footage_short 造成总时长漂移。
+    demands = [boundaries[i + 1] - boundaries[i] for i in range(n_segs)]
+    capacities = [clip.duration - _wrap_offset(clip) for clip in video_clips]
+    clip_assign = assign_clips(n_segs, len(video_clips), weights,
+                               demands=demands, capacities=capacities)
     segments, issues = plan_segments(boundaries, clip_assign, video_clips,
                                      beat_grid.beat_duration, clip_names=clip_names,
                                      transition=TRANSITION_MODE)
     for msg in issues:
         print(f"  警告: {msg}")
     status["messages"].extend(issues)
-    apply_labels(segments, pattern)
+    apply_labels(segments, seg_labels)
 
     audio_info = {
         "path": os.path.basename(audio_path),
