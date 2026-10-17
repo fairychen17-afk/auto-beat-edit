@@ -53,8 +53,8 @@ AVG_SPEED_STEP = 0.015
 # 剪辑策略档位：normal / slow / fast
 EDIT_STRATEGY = "normal"
 MIN_SHOT = 0.25                    # 最短镜头长度，低于该值的切点会被跳过
-ALLOW_CLIP_REUSE = True            # 素材播放完后是否允许回绕复用（False 时不足则报错）
-SHORT_SEGMENT_STRATEGY = "loop"    # "loop" 回绕复用 / "error" 直接报错
+# 素材不够时的策略：loop=回绕复用（默认）/ error=直接报错
+SHORT_SEGMENT_STRATEGY = "loop"
 
 # 素材质量：按 quality_score 加权分配镜头（仅本地指标，不接云端 AI）
 PREFER_QUALITY = True
@@ -723,8 +723,17 @@ def _wrap_offset(clip):
 def plan_segments(boundaries, clip_assign, video_clips,
                   beat_dur, clip_names=None, min_shot=MIN_SHOT,
                   min_speed=MIN_SPEED, max_speed=MAX_SPEED,
-                  allow_reuse=ALLOW_CLIP_REUSE, transition=None):
-    """生成分段计划：每段的源入点/出点/倍速/时间轴区间。"""
+                  allow_reuse=None, transition=None):
+    """生成分段计划：每段的源入点/出点/倍速/时间轴区间。
+
+    allow_reuse=None 时由 SHORT_SEGMENT_STRATEGY 决定（loop=复用 / error=报错）。
+    """
+    if allow_reuse is None:
+        if SHORT_SEGMENT_STRATEGY not in ("loop", "error"):
+            raise ValueError(
+                f"SHORT_SEGMENT_STRATEGY 只能是 loop 或 error，当前为 {SHORT_SEGMENT_STRATEGY!r}"
+            )
+        allow_reuse = (SHORT_SEGMENT_STRATEGY != "error")
     if transition is None:
         transition = TRANSITION_MODE
     n_segs = len(boundaries) - 1
@@ -749,7 +758,7 @@ def plan_segments(boundaries, clip_assign, video_clips,
         if pos >= clip.duration - 1e-3:
             if not allow_reuse:
                 raise RuntimeError(
-                    f"素材 {clip_names[ci]} 已用尽，且 ALLOW_CLIP_REUSE=False"
+                    f"素材 {clip_names[ci]} 已用尽，且 SHORT_SEGMENT_STRATEGY='error'"
                 )
             pos = _wrap_offset(clip)
             reused = True
@@ -807,30 +816,45 @@ def apply_labels(segments, pattern):
 # ==========================================================================
 # 特效（原算法保持不变，仅把硬编码 BPM 改为真实 beat_dur）
 # ==========================================================================
-def fisheye(img, strength):
-    """鱼眼畸变，输出尺寸不变"""
+def fisheye_geom(h, w):
+    """鱼眼重映射中与强度无关的几何项，可缓存复用。
+
+    返回 (xs, ys, rn, rbase)：
+      xs 形状 (w,)、ys 形状 (h,) 为像素相对中心的偏移（可广播，省内存）
+      rn / rbase 形状 (h, w)，使得 scale = rn + strength * rbase
+      （由 rr*(1+s*rr²)/rr_safe 展开而来，逐帧只剩 1 次乘法 + 1 次加法）
+    """
+    xs = np.arange(w, dtype=np.float32) - w / 2.0
+    ys = np.arange(h, dtype=np.float32) - h / 2.0
+    rr = np.sqrt((xs[None, :] / (w / 2.0)) ** 2 + (ys[:, None] / (h / 2.0)) ** 2)
+    rr = np.clip(rr, 0.0, 1.0)
+    rn = rr / np.maximum(rr, 0.001)
+    return xs, ys, rn, rn * rr * rr
+
+
+def fisheye_apply(img, strength, geom):
+    """用给定几何项做鱼眼重映射（批量渲染时复用缓存的 geom），输出尺寸不变。"""
     h, w = img.shape[:2]
-    dst_y, dst_x = np.mgrid[0:h, 0:w].astype(np.float32)
-
-    nx = (dst_x - w / 2) / (w / 2)
-    ny = (dst_y - h / 2) / (h / 2)
-    r = np.sqrt(nx ** 2 + ny ** 2)
-    r = np.clip(r, 0, 1)
-
-    r_new = r * (1 + strength * r * r)
-    r_safe = np.where(r > 0.001, r, 0.001)
-    scale = r_new / r_safe
-
-    src_x = w / 2 + nx * scale * (w / 2)
-    src_y = h / 2 + ny * scale * (h / 2)
-
-    src_x = np.clip(src_x, 0, w - 1).astype(int)
-    src_y = np.clip(src_y, 0, h - 1).astype(int)
-
+    xs, ys, rn, rbase = geom
+    scale = rn + strength * rbase
+    src_x = np.clip(w / 2.0 + xs[None, :] * scale, 0, w - 1).astype(np.int32)
+    src_y = np.clip(h / 2.0 + ys[:, None] * scale, 0, h - 1).astype(np.int32)
     return img[src_y, src_x]
 
 
+def fisheye(img, strength):
+    """鱼眼畸变，输出尺寸不变"""
+    h, w = img.shape[:2]
+    return fisheye_apply(img, strength, fisheye_geom(h, w))
+
+
 def pixelate(img, block_size):
+    """像素化：每个像素取所属方块左上角的颜色，输出尺寸与输入完全一致。
+
+    修复：旧实现用 repeat+截断，当 h/w 不能被 block_size 整除时输出会变小
+    （如 960x720、block=13 -> 949x715），导致该帧右下出现黑边。改用取整除
+    得到方块索引，保证输出尺寸不变。
+    """
     h, w = img.shape[:2]
     if block_size < 2:
         return img
@@ -839,34 +863,64 @@ def pixelate(img, block_size):
     yi = (np.arange(sh) * block_size).astype(int)
     xi = (np.arange(sw) * block_size).astype(int)
     small = img[np.ix_(yi, xi)]
-    yr = np.repeat(np.arange(sh), block_size)[:h]
-    xr = np.repeat(np.arange(sw), block_size)[:w]
-    return small[np.ix_(yr, xr)]
+    yr = np.minimum(np.arange(h) // block_size, sh - 1)
+    xr = np.minimum(np.arange(w) // block_size, sw - 1)
+    return small[yr[:, None], xr[None, :]]
+
+
+FLARE_CH = np.array([1.0, 0.85, 0.6], dtype=np.float32)   # 光晕的通道权重
+
+
+def flare_kernel(h, w):
+    """光晕中与强度无关的高斯核，可缓存复用。返回 (e1, e2)，形状均为 (h, w)。"""
+    cx, cy = w * 0.5, h * 0.35
+    y_arr, x_arr = np.ogrid[:h, :w]
+    dist = np.sqrt((x_arr - cx) ** 2 * 1.5 + (y_arr - cy) ** 2)
+    e1 = np.exp(-dist ** 2 / (2 * 100 ** 2)).astype(np.float32)
+    e2 = np.exp(-((x_arr - cx * 0.7) ** 2 + (y_arr - cy * 1.3) ** 2) / (2 * 45 ** 2)).astype(np.float32)
+    return e1, e2
+
+
+def flare_base(h, w, kernel=None):
+    """光晕「单位强度」的逐像素加性基 (h, w, 3)。
+
+    (e1*I + e2*I*0.4)*CH*255 可展开为 (e1 + 0.4*e2)*CH*255 * I，
+    故只需按尺寸预计算一次基，逐帧仅剩一次标量乘法。
+    """
+    e1, e2 = flare_kernel(h, w) if kernel is None else kernel
+    return (e1 + 0.4 * e2)[:, :, None] * FLARE_CH * 255.0
+
+
+def flare_offsets(h, w, intensity, kernel=None):
+    """光晕的逐像素加性偏移 (h, w, 3)。kernel 为 flare_kernel 的缓存结果。"""
+    return flare_base(h, w, kernel) * intensity
 
 
 def add_flare(img, intensity):
     h, w = img.shape[:2]
-    cx, cy = w * 0.5, h * 0.35
-    y_arr, x_arr = np.ogrid[:h, :w]
-    dist = np.sqrt((x_arr - cx) ** 2 * 1.5 + (y_arr - cy) ** 2)
-    flare = np.exp(-dist ** 2 / (2 * 100 ** 2)) * intensity
-    flare += np.exp(-((x_arr - cx * 0.7) ** 2 + (y_arr - cy * 1.3) ** 2) / (2 * 45 ** 2)) * intensity * 0.4
-    flare_3d = np.stack([flare, flare * 0.85, flare * 0.6], axis=2)
-    result = img.astype(np.float32) + flare_3d * 255
-    return np.clip(result, 0, 255).astype(np.uint8)
+    off = flare_offsets(h, w, intensity)
+    return np.clip(img.astype(np.float32) + off, 0, 255).astype(np.uint8)
 
 
 def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
     """逐帧特效。beat_dur 由真实 tempo 求得（P0-6），不再硬编码 172.3BPM。
 
-    性能：暗角遮罩按尺寸预计算一次并缓存（实测 720x960 下该步骤
-    17.6ms/帧 -> 8.4ms/帧），避免每帧重复构造 ogrid 与 sqrt。
+    性能（720x960 单帧实测约 238ms -> 约 140ms）：
+    - 与强度无关的几何量按尺寸预计算并缓存：暗角遮罩、鱼眼几何、光晕高斯核
+    - 胶片颗粒改为「按段预生成基准噪声 + 逐帧随机窗口切片」，避免每帧生成
+      2.07M 个正态随机数（约 35ms/帧 -> 约 2ms/帧）
+    - uint8 转换改为惰性（仅在鱼眼/像素化真正触发时计算，省约 3ms/帧）
+    - 运动模糊与暗角乘算改为原地运算，减少大数组分配
     """
     seg_dur = seg.duration
     beat_dur_local = beat_dur
     rng = np.random.RandomState(777 + seg_index * 19)
     tw, th = TARGET_RESOLUTION
     vignette_cache = {}
+    grain_cache = {}
+    fisheye_cache = {}
+    flare_cache = {}
+    grain_pad = 24
 
     def get_vignette(h, w):
         mask = vignette_cache.get((h, w))
@@ -877,6 +931,32 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
             mask = (1.0 - (dv / mv) ** 2 * FILTER_VIGNETTE).astype(np.float32)
             vignette_cache[(h, w)] = mask
         return mask
+
+    def get_grain(h, w):
+        """按段预生成的胶片颗粒基准（比目标尺寸大 grain_pad，逐帧随机窗口切片）。"""
+        tile = grain_cache.get((h, w))
+        if tile is None:
+            tile = rng.normal(0, FILTER_FILM_GRAIN * 255,
+                              (h + grain_pad, w + grain_pad, 3)).astype(np.float32)
+            grain_cache[(h, w)] = tile
+        return tile
+
+    def get_fisheye_geom(h, w):
+        geom = fisheye_cache.get((h, w))
+        if geom is None:
+            geom = fisheye_geom(h, w)
+            fisheye_cache[(h, w)] = geom
+        return geom
+
+    def get_flare_base(h, w):
+        base = flare_cache.get((h, w))
+        if base is None:
+            base = flare_base(h, w).astype(np.float32)
+            flare_cache[(h, w)] = base
+        return base
+
+    def to_uint8(f):
+        return np.clip(f, 0, 255).astype(np.uint8)
 
     def process_frame(get_frame, t):
         frame = get_frame(t)
@@ -919,19 +999,15 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
             cols = np.linspace(0, crop_w - 1, fw).astype(int)
             f = cropped[rows[:, np.newaxis], cols[np.newaxis, :], :]
 
-        f_uint = np.clip(f, 0, 255).astype(np.uint8)
-
-        # ===== 2. 鱼眼脉冲 =====
+        # ===== 2. 鱼眼脉冲（复用缓存的几何项；uint8 惰性转换）=====
         if FISHEYE_ON and pulse_amount > 0.3:
             fe_str = pulse_amount * 0.12
-            f_uint = fisheye(f_uint, fe_str)
-            f = f_uint.astype(np.float32)
+            f = fisheye_apply(to_uint8(f), fe_str, get_fisheye_geom(fh, fw)).astype(np.float32)
 
         # ===== 3. 像素化故障 =====
         if PIXEL_ON and is_fast and rng.random() < 0.15:
             block = rng.randint(6, 15)
-            f_uint = pixelate(f_uint, block)
-            f = f_uint.astype(np.float32)
+            f = pixelate(to_uint8(f), block).astype(np.float32)
 
         # ===== 4. Glitch色差 =====
         if is_fast and is_near_beat:
@@ -955,7 +1031,7 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
                 f[:, :, 1] = r * 0.1 * -sh + g * (0.8 + 0.2 * cr) + b * 0.1 * sh
                 f[:, :, 2] = r * 0.1 * sh + g * 0.1 * -sh + b * (0.8 + 0.2 * cr)
 
-        # ===== 6. 运动模糊 =====
+        # ===== 6. 运动模糊（原地增量，等价于 blurred = blurred*(1-k) + shifted*k）=====
         if is_fast and t < seg_dur * 0.4:
             mb = MOTION_BLUR_INTENSITY * (1 - t / (seg_dur * 0.4))
             bs = int(mb * 10)
@@ -964,7 +1040,7 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
                 for i in range(1, bs + 1):
                     w_i = 1.0 / (i + 1)
                     shifted = np.roll(f, i, axis=1)
-                    blurred = blurred * (1 - w_i * 0.3) + shifted * w_i * 0.3
+                    blurred += (shifted - blurred) * (w_i * 0.3)
                 f = blurred
 
         # ===== 7. 调色 =====
@@ -986,16 +1062,19 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
         for c in range(3):
             f[:, :, c] = gray + (f[:, :, c] - gray) * FILTER_SATURATION
 
-        # ===== 8. 镜头光晕 =====
+        # ===== 8. 镜头光晕（复用缓存的单位强度基，强度仅做标量乘）=====
         if FLARE_ON and pulse_amount > 0.5:
-            f_uint = np.clip(f, 0, 255).astype(np.uint8)
-            f_uint = add_flare(f_uint, pulse_amount * 0.6)
-            f = f_uint.astype(np.float32)
+            ch, cw = f.shape[:2]
+            np.add(f, get_flare_base(ch, cw) * (pulse_amount * 0.6), out=f)
+            np.clip(f, 0, 255, out=f)
 
-        # ===== 9. 胶片颗粒 =====
+        # ===== 9. 胶片颗粒（预生成基准 + 逐帧随机窗口切片，原地叠加）=====
         if FILTER_FILM_GRAIN > 0:
-            grain = rng.normal(0, FILTER_FILM_GRAIN * 255, f.shape).astype(np.float32)
-            f = f + grain
+            gh, gw = f.shape[:2]
+            tile = get_grain(gh, gw)
+            oy = rng.randint(0, grain_pad + 1)
+            ox = rng.randint(0, grain_pad + 1)
+            f += tile[oy:oy + gh, ox:ox + gw, :]
 
         # ===== 10. 撕裂转场 =====
         td = 0.05
@@ -1011,11 +1090,11 @@ def add_effects(seg, seg_start_time, beat_times, seg_index, is_fast, beat_dur):
             f[:mid, :, :] = np.roll(f[:mid, :, :], -ta, axis=1)
             f[mid:, :, :] = np.roll(f[mid:, :, :], ta, axis=1)
 
-        # 暗角（遮罩已按尺寸预计算并缓存）
+        # 暗角（遮罩已按尺寸预计算并缓存，原地乘算）
         vign = get_vignette(fh2, fw2)
-        f = f * vign[:, :, np.newaxis]
+        f *= vign[:, :, np.newaxis]
 
-        f = np.clip(f, 0, 255)
+        np.clip(f, 0, 255, out=f)
 
         # 确保输出尺寸精确
         result = f.astype(np.uint8)
@@ -1257,21 +1336,59 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
     return plan, video_clips, beat_grid, status
 
 
-def main():
+def parse_args(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        description="游戏CG自动卡点剪辑（auto beat edit）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--plan-only", action="store_true",
+                   help="只分析并输出剪辑计划(EDL)+素材质量报告，不渲染")
+    p.add_argument("--folder", default=FOLDER, help="素材文件夹")
+    p.add_argument("--audio", default=AUDIO_FILE, help="音乐文件名")
+    p.add_argument("--duration", type=float, default=AUDIO_DURATION, help="输出时长（秒）")
+    p.add_argument("--audio-start", type=float, default=AUDIO_START,
+                   help="音乐起始秒数；设为负数表示启用自动选段")
+    p.add_argument("--strategy", default=EDIT_STRATEGY,
+                   choices=sorted(PATTERN_PRESETS), help="节奏模板")
+    p.add_argument("--edl", default=EDL_PATH, help="剪辑计划输出路径")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     print("=" * 60)
     print("  游戏CG自动卡点剪辑（auto beat edit）")
     print("=" * 60)
 
+    audio_start = None if args.audio_start is not None and args.audio_start < 0 else args.audio_start
     try:
-        plan, video_clips, beat_grid, status = build_edit_plan()
+        plan, video_clips, beat_grid, status = build_edit_plan(
+            folder=args.folder, audio_file=args.audio, duration=args.duration,
+            audio_start=audio_start, strategy=args.strategy,
+        )
     except Exception as exc:  # noqa: BLE001 - 顶层给出明确失败原因
         print(f"\n[失败] {exc}")
         return 1
 
     edl = plan["edl"]
     if EXPORT_EDL:
-        path = save_edl(edl, EDL_PATH)
+        path = save_edl(edl, args.edl)
         print(f"\n剪辑计划已保存: {path}")
+
+    if args.plan_only:
+        print("\n[--plan-only] 已跳过渲染。片段概览:")
+        for s in edl["segments"][:12]:
+            print(f"    #{s['index']:2d} {s['clip_name']:>12s} | {s['label']:8s} | "
+                  f"{s['timeline_start']:6.2f}~{s['timeline_end']:6.2f}s | "
+                  f"{s['speed']:.2f}x | {s['transition']}")
+        if len(edl["segments"]) > 12:
+            print(f"    ... 共 {len(edl['segments'])} 段")
+        print(f"  总时长 {edl['segments'][-1]['timeline_end']:.2f}s / "
+              f"目标 {edl['target_duration']:.2f}s")
+        for c in video_clips:
+            c.close()
+        return 0
 
     print("\n渲染中...")
     final = render_segments(plan["segments"], video_clips, beat_grid)

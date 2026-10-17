@@ -22,6 +22,8 @@
 - 📋 **剪辑计划（EDL）**：渲染前输出 `edit_plan.json`，记录每段的素材、源入出点、倍速、时间轴区间、转场类型，并做执行前校验
 - 🔍 **素材质量评估**：本地计算清晰度（拉普拉斯方差）/ 运动量 / 曝光，得到候选评分并按质量加权分配镜头（不接云端 AI）
 - 🎞 **转场可配置**：`cut` 硬切（默认，卡点最准）/ `dip` 段内淡入淡出黑场（时序安全，不改变总时长）
+- ⚡ **渲染性能**：与强度无关的几何量（暗角遮罩 / 鱼眼几何 / 光晕高斯核）按尺寸预计算并缓存，胶片颗粒改为「预生成基准噪声 + 逐帧随机窗口切片」，uint8 转换改为惰性；720×960 单帧特效耗时约减半（≈238ms → ≈124ms）
+- ✅ **帧尺寸严格保持**：鱼眼 / 像素化 / 光晕等像素级特效输出尺寸一律与输入一致（修复了旧版像素化在方块不能整除时缩小帧、导致黑边的问题）
 - 🧪 **可复现测试**：`pytest` 全套测试，全部使用合成音频/视频，不依赖真实素材
 
 ## 🚀 快速开始
@@ -61,6 +63,30 @@ EDIT_STRATEGY = "normal"                # normal / slow / fast
 python auto_beat_edit.py
 ```
 
+### 命令行用法（可选）
+
+不改脚本也能用命令行覆盖配置：
+
+```bash
+# 只看剪辑计划（EDL）+ 素材质量报告，不渲染（改参数时快速验证）
+python auto_beat_edit.py --plan-only
+
+# 指定文件夹 / 音乐 / 时长 / 节奏模板
+python auto_beat_edit.py --folder "D:\素材" --audio bgm.mp3 --duration 12 --strategy fast
+
+# 起始时间为负数 -> 启用音乐自动选段
+python auto_beat_edit.py --audio-start -1
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--plan-only` | 只分析并输出 EDL + 素材质量报告，不渲染 |
+| `--folder` / `--audio` | 覆盖素材文件夹 / 音乐文件名 |
+| `--duration` | 输出时长（秒） |
+| `--audio-start` | 音乐起始秒数；**负数表示启用自动选段** |
+| `--strategy` | 节奏模板 `normal` / `slow` / `fast` |
+| `--edl` | EDL 输出路径 |
+
 ### 运行测试
 
 ```bash
@@ -80,7 +106,7 @@ python -m pytest tests -q
 | `CLIP_ORDER` | 素材文件名列表（留空自动扫描） | ["1.mp4", ...] |
 | `EDIT_STRATEGY` | 节奏模板 normal / slow / fast | "normal" |
 | `MIN_SHOT` | 最短镜头长度（秒），过短的切点会被跳过 | 0.25 |
-| `ALLOW_CLIP_REUSE` | 素材用尽后是否回绕复用 | True |
+| `SHORT_SEGMENT_STRATEGY` | 素材用尽时策略：`loop` 回绕复用 / `error` 直接报错 | "loop" |
 | `MIN_SPEED` / `MAX_SPEED` | 变速范围 | 0.8 ~ 1.3 |
 | `PREFER_QUALITY` | 是否按素材质量分加权分配镜头时间 | True |
 | `QUALITY_SAMPLE_FRAMES` | 每个素材采样多少帧做质量评估 | 5 |

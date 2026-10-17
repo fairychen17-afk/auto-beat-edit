@@ -448,6 +448,94 @@ def test_plan_segments_default_transition_is_cut(tiny_videos):
         c.close()
 
 
+def test_plan_segments_honours_short_segment_strategy(tiny_videos, monkeypatch):
+    """allow_reuse 未显式给出时，应由 SHORT_SEGMENT_STRATEGY 统一驱动。"""
+    folder, files = tiny_videos
+    clips, names, _ = abe.prepare_video_clips([files[0]], target_resolution=None)
+    boundaries = [0.0, 2.0, 4.0, 6.0, 8.0]
+    assign = abe.assign_clips(4, 1)
+
+    monkeypatch.setattr(abe, "SHORT_SEGMENT_STRATEGY", "error")
+    with pytest.raises(RuntimeError):
+        abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names)
+
+    monkeypatch.setattr(abe, "SHORT_SEGMENT_STRATEGY", "loop")
+    segs, _ = abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names)
+    assert any(s.reused for s in segs)
+
+    monkeypatch.setattr(abe, "SHORT_SEGMENT_STRATEGY", "bogus")
+    with pytest.raises(ValueError):
+        abe.plan_segments(boundaries, assign, clips, 0.5, clip_names=names)
+
+    for c in clips:
+        c.close()
+
+
+def test_parse_args_plan_only_and_auto_start():
+    args = abe.parse_args(["--plan-only", "--duration", "6.0",
+                           "--audio-start", "-1", "--strategy", "slow"])
+    assert args.plan_only is True
+    assert args.duration == pytest.approx(6.0)
+    assert args.audio_start == pytest.approx(-1.0)
+    assert args.strategy == "slow"
+
+    default = abe.parse_args([])
+    assert default.plan_only is False
+    with pytest.raises(SystemExit):
+        abe.parse_args(["--strategy", "nope"])
+
+
+# ==========================================================================
+# 特效完整性 / 性能回归（帧尺寸必须保持不变）
+# ==========================================================================
+def test_pixelate_preserves_shape_for_all_blocks():
+    """旧实现在 h/w 不能被 block 整除时会缩小帧（导致黑边），必须修复。"""
+    img = np.random.RandomState(0).randint(0, 255, (128, 96, 3)).astype(np.uint8)
+    for block in range(2, 20):
+        out = abe.pixelate(img, block)
+        assert out.shape == img.shape, (block, out.shape)
+        assert out.dtype == np.uint8
+    # 分块正确：同一块内颜色相同（block=8 时 128/96 均可整除）
+    out = abe.pixelate(img, 8)
+    assert np.array_equal(out[0:8, 0:8], np.broadcast_to(out[0, 0], (8, 8, 3)))
+
+
+def test_fisheye_and_flare_preserve_shape():
+    img = np.random.RandomState(1).randint(0, 255, (128, 96, 3)).astype(np.uint8)
+    assert abe.fisheye(img, 0.12).shape == img.shape
+    assert abe.fisheye(img, 0.0).shape == img.shape
+    assert abe.add_flare(img, 0.5).shape == img.shape
+
+
+def test_add_effects_preserves_frame_size_and_dtype(monkeypatch):
+    """整条特效链必须保持帧尺寸与 uint8，且分析头/慢两种路径都不崩。"""
+    monkeypatch.setattr(abe, "TARGET_RESOLUTION", (96, 128))
+    clip = ColorClip(size=(96, 128), color=(120, 60, 200), duration=1.0)
+    beats = np.arange(0.0, 2.0, 0.5)
+    # 首个采样点上 pulse_amount≈1.0，会触发鱼眼 + 光晕
+    for is_fast in (True, False):
+        for idx in range(4):
+            fx = abe.add_effects(clip, 0.0, beats, idx, is_fast, 0.5)
+            frame = fx.get_frame(0.0)
+            assert frame.shape == (128, 96, 3), frame.shape
+            assert frame.dtype == np.uint8
+            fx.close()
+    clip.close()
+
+
+def test_main_plan_only_writes_edl_without_rendering(tmp_path, monkeypatch, tiny_videos):
+    folder, files = tiny_videos
+    audio = os.path.join(folder, "track.wav")
+    synth_click_track(audio, total=12.0, bpm=120.0, active=(0.0, 12.0))
+    monkeypatch.setattr(abe, "TARGET_RESOLUTION", (96, 128))
+
+    edl_out = str(tmp_path / "plan.json")
+    code = abe.main(["--plan-only", "--folder", folder, "--audio", "track.wav",
+                     "--duration", "3.0", "--audio-start", "1.0", "--edl", edl_out])
+    assert code == 0
+    assert os.path.exists(edl_out)
+
+
 def test_dip_transition_is_timing_safe(tmp_path, monkeypatch, tiny_videos):
     folder, files = tiny_videos
     audio = os.path.join(folder, "track.wav")
