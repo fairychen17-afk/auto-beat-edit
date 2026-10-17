@@ -60,6 +60,8 @@ def timeline_to_dict(tl: Timeline, width: int, height: int, fps: int) -> dict:
             "transition_out": s.transition,
             "transition_dur": round(tdur, 3),
             "music_energy": round(s.energy, 3),
+            "music_tension": round(getattr(s, "tension", 0.5), 3),
+            "material_quality": round(getattr(s, "quality", 0.5), 3),
             # 卡点位置：该段中点（转场中点重合处即卡点）
             "cut_at": round(cursor + s.duration / 2, 3),
             "why": s.why,

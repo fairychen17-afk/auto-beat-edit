@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 from .audio_analyzer import analyze_bgm, scan_bgm_library, AUDIO_EXTS
 from .bgm_matcher import auto_style, material_mood, material_profile, pick_bgm
 from .scene_detect import scan_materials
@@ -71,8 +73,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[2/4] 分析 BGM: {bgm_path}")
     if bgm_path.is_dir():
         candidates = scan_bgm_library(bgm_path)
+    elif bgm_path.is_file():
+        try:
+            candidates = [analyze_bgm(bgm_path)]
+        except Exception as e:
+            print(f"BGM 分析失败（文件损坏或格式不支持）: {e}")
+            return 1
     else:
-        candidates = [analyze_bgm(bgm_path)]
+        print(f"BGM 路径不存在: {bgm_path}")
+        return 1
     if not candidates:
         print("未找到可用 BGM")
         return 1
@@ -110,6 +119,11 @@ def main(argv: list[str] | None = None) -> int:
     if tl.bgm_sections:
         secs = " ".join(f"{s:.0f}-{e:.0f}s:{lv}" for s, e, lv in tl.bgm_sections[:6])
         print(f"      BGM 结构：{secs}（low=前奏/间奏，high=副歌/drop）")
+    if getattr(bgm, "tension_t", None) is not None and len(bgm.tension_t):
+        peak_i = int(np.argmax(bgm.tension_v))
+        n_bars = len(bgm.bar_times) if bgm.bar_times is not None else 0
+        print(f"      张力峰值在 {bgm.tension_t[peak_i]:.1f}s "
+              f"（张力={bgm.tension_v[peak_i]:.2f}，共 {n_bars} 小节）")
 
     # 手法统计：让"剪得怎么样"可被看见
     durs = [s.duration for s in tl.segments]

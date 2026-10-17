@@ -79,13 +79,14 @@ class TestBeatGrid(unittest.TestCase):
         counts = _beat_counts(bgm, 0, 6, "energetic")
         self.assertTrue(all(c >= 4 for c in counts), counts)
 
-    def test_structure_flags_detect_jump(self):
-        bgm = make_bgm(bpm=120.0, dur=30.0)
-        env = np.zeros_like(bgm.onset_env)
-        env[int(6.0 * bgm.onset_fps):] = 1.0     # 6s 处能量阶跃
-        bgm.onset_env = env
-        flags = _structure_flags(bgm, 0, [4] * 6)
-        self.assertTrue(any(flags), flags)
+    def test_structure_flags_from_sections(self):
+        """结构边界标记直接来自修正后的 sections（10s 处低→高）。"""
+        bgm = make_bgm(bpm=120.0, dur=30.0,
+                       sections=[(0.0, 10.0, "low"), (10.0, 30.0, "high")])
+        flags = _structure_flags(bgm, 0, [4] * 6)   # 段起点 0/2/4/6/8/10s
+        self.assertFalse(flags[0])
+        self.assertTrue(flags[5])                   # 10s 处命中边界
+        self.assertFalse(any(flags[1:5]))           # 其余不误报
 
 
 class TestPlanShotsRules(unittest.TestCase):
