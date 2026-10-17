@@ -63,7 +63,11 @@ SHORT_SEGMENT_STRATEGY = "loop"
 # 素材质量：按 quality_score 加权分配镜头（仅本地指标，不接云端 AI）
 PREFER_QUALITY = True
 QUALITY_SAMPLE_FRAMES = 5          # 每个素材采样多少帧做质量评估
-QUALITY_MIN_WARN = 0.3            # 低于该质量分的素材给出提示
+QUALITY_MIN_WARN = 0.3            # 低于该质量分的素材给出提示并按下面系数降权
+# 低分素材的分配权重系数：让「低分」真的少分配镜头，而不只是打印一句提示。
+# 不直接跳过——素材不足时低分素材仍要能用；且当所有素材都低分时相对权重不变，
+# 行为自动退化为原来的纯候选分加权（不会因为阈值而分配到无镜头可用）。
+LOW_QUALITY_WEIGHT_SCALE = 0.3
 
 # 素材内窗口优选：同一个素材里挑「更锐利 / 更有运动 / 曝光更健康」的时间窗口，
 # 避开片头片尾的黑帧、淡入淡出与长时间静止段——让素材质量分析真正作用于
@@ -695,6 +699,20 @@ def analyze_assets(video_files, target_duration=0.0, sample_frames=QUALITY_SAMPL
     return infos
 
 
+def _asset_weight(info, min_warn=QUALITY_MIN_WARN,
+                  scale=LOW_QUALITY_WEIGHT_SCALE):
+    """由单个素材的分析结果算出分配权重。
+
+    质量分低于 min_warn 的素材按 scale 降权，让 QUALITY_MIN_WARN 不只是打印提示，
+    而是真的影响镜头分配；不做硬跳过，避免素材数不足，也避免「所有素材都低分」时
+    配出一份没人可用的计划（那种情况下相对权重不变，自动退化为原行为）。
+    """
+    w = max(1e-6, float(info.candidate_score))
+    if float(info.quality_score) < min_warn:
+        w *= float(scale)
+    return w
+
+
 def quality_weights(infos, names=None, prefer_quality=PREFER_QUALITY):
     """由素材质量分生成分配权重（把更多镜头时间给更优质的素材）。
 
@@ -703,10 +721,9 @@ def quality_weights(infos, names=None, prefer_quality=PREFER_QUALITY):
     if not prefer_quality or not infos:
         return None
     if names is None:
-        return [max(1e-6, float(i.candidate_score)) for i in infos]
+        return [_asset_weight(i) for i in infos]
     by_name = {i.name: i for i in infos}
-    return [max(1e-6, float(by_name[n].candidate_score)) if n in by_name else 1.0
-            for n in names]
+    return [_asset_weight(by_name[n]) if n in by_name else 1.0 for n in names]
 
 
 # ==========================================================================
@@ -1544,7 +1561,8 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
     if verbose:
         print("\n素材质量评估（相对候选评分）:")
         for a in assets:
-            flag = "  ⚠低分" if a.quality_score < QUALITY_MIN_WARN else ""
+            flag = ("  ⚠低分(已降权)"
+                    if a.quality_score < QUALITY_MIN_WARN else "")
             ws = a.window_score or []
             wtxt = f" 窗口 {min(ws):.2f}~{max(ws):.2f}" if ws else ""
             print(f"  {a.name}: 质量 {a.quality_score:.2f} "

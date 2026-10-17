@@ -113,7 +113,8 @@ python -m pytest tests -q
 | `MIN_SPEED` / `MAX_SPEED` | 变速范围 | 0.8 ~ 1.3 |
 | `PREFER_QUALITY` | 是否按素材质量分加权分配镜头时间 | True |
 | `QUALITY_SAMPLE_FRAMES` | 每个素材采样多少帧做质量评估 | 5 |
-| `QUALITY_MIN_WARN` | 低于该质量分给出提示 | 0.3 |
+| `QUALITY_MIN_WARN` | 低于该质量分给出提示并按下一项降权 | 0.3 |
+| `LOW_QUALITY_WEIGHT_SCALE` | 低分素材的分配权重系数（降权，不硬跳过） | 0.3 |
 | `WINDOW_SELECT` | 是否启用素材内窗口优选（取素材内部画面更好的一段） | True |
 | `WINDOW_CANDIDATES` | 每个素材内部均匀采样的候选窗口数 | 12 |
 | `WINDOW_EDGE_GUARD` | 片头/片尾保护区时长（秒），避开黑帧与淡入淡出 | 0.15 |
@@ -142,6 +143,8 @@ python -m pytest tests -q
 三者在**本次素材集合内做 min-max 归一化**，得到 `quality_score = 0.5·清晰度 + 0.3·运动量 + 0.2·曝光`，再与「时长可用度」合成 `candidate_score`。
 
 > ⚠️ 这些分数是**集合内相对值**，属于「候选评分」，**不代表绝对主观质量**；`PREFER_QUALITY=True` 时按 `candidate_score` 加权分配镜头时间（更优质的素材分到更多镜头），避免连续重复同一素材。
+
+质量分低于 `QUALITY_MIN_WARN` 的素材会再乘以 `LOW_QUALITY_WEIGHT_SCALE` **降权**（少分配镜头），所以「低分」不只是打印一句提示。这里刻意**不做硬跳过**：素材数不足时低分素材仍然要能用；而且当所有素材都低分时相对权重不变，行为自动退化为原来的纯候选分加权，不会因为一个阈值就配出「没人可用」的计划。
 
 同一个素材内部还会做**窗口优选**（`WINDOW_SELECT=True`）：在每个素材里均匀取 `WINDOW_CANDIDATES` 个候选时间点，各自算一份同样的「清晰度 0.5 / 运动量 0.3 / 曝光 0.2」本地分（素材内归一化），分段落位时优先选分高的窗口、并按 `WINDOW_OVERLAP_PENALTY` 对与已用画面的重叠扣分。因此片头的黑帧、淡入淡出和长时间静止段会自然被跳过。窗口优选只改源入点 `source_in`，**不改变任何片段时长**，总时长与卡点精度不受影响。
 

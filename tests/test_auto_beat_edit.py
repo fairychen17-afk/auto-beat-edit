@@ -498,6 +498,31 @@ def test_quality_weights_aligns_to_clip_names(tmp_path):
     assert abe.quality_weights(infos, None, prefer_quality=False) is None
 
 
+def _asset(name, quality, candidate):
+    i = abe.AssetInfo(name=name, duration=2.0, width=64, height=80,
+                      aspect=0.8, has_audio=False)
+    i.quality_score = quality
+    i.candidate_score = candidate
+    return i
+
+
+def test_quality_min_warn_actually_downweights_low_quality():
+    """同一个候选分下，低于 QUALITY_MIN_WARN 的素材必须拿到更小的权重。"""
+    low = _asset("low.mp4", abe.QUALITY_MIN_WARN - 0.05, 0.6)
+    good = _asset("good.mp4", abe.QUALITY_MIN_WARN + 0.3, 0.6)
+    weights = abe.quality_weights([low, good], None)
+    assert weights[0] < weights[1]
+    assert weights[0] == pytest.approx(0.6 * abe.LOW_QUALITY_WEIGHT_SCALE)
+
+
+def test_all_low_quality_assets_keep_relative_proportions():
+    """所有素材都低分时相对权重不变，不会因此配出无人可用的计划。"""
+    a = _asset("a.mp4", 0.1, 0.8)
+    b = _asset("b.mp4", 0.1, 0.4)
+    weights = abe.quality_weights([a, b], None)
+    assert weights[0] / weights[1] == pytest.approx(0.8 / 0.4)
+
+
 def test_assign_clips_weighted_bias():
     seq = abe.assign_clips(20, 3, weights=[3.0, 1.0, 1.0])
     counts = [seq.count(i) for i in range(3)]
