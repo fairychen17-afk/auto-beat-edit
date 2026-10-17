@@ -10,7 +10,7 @@ import sys
 import numpy as np
 import pytest
 import soundfile as sf
-from moviepy import ColorClip
+from moviepy import ColorClip, ImageSequenceClip
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -59,6 +59,23 @@ def tiny_videos(tmp_path):
         clip.close()
         files.append(str(p))
     return str(tmp_path), files
+
+
+def make_pattern_video(path, size=(64, 80), fps=12, n=14):
+    """高对比 + 逐帧移动的素材（清晰度高、运动量大）。"""
+    rng = np.random.RandomState(3)
+    base = rng.randint(0, 255, (size[1], size[0], 3)).astype(np.uint8)
+    frames = [np.roll(base, (i * 7) % size[0], axis=1) for i in range(n)]
+    c = ImageSequenceClip(frames, fps=fps)
+    c.write_videofile(str(path), fps=fps, codec="libx264", audio=False, logger=None)
+    c.close()
+
+
+def make_flat_video(path, size=(64, 80), fps=12, duration=2.0):
+    """纯色素材（清晰度≈0、运动≈0）。"""
+    c = ColorClip(size=size, color=(128, 128, 128), duration=duration)
+    c.write_videofile(str(path), fps=fps, codec="libx264", audio=False, logger=None)
+    c.close()
 
 
 # ==========================================================================
@@ -365,3 +382,99 @@ def test_build_edit_plan_missing_audio_folder(tmp_path):
     with pytest.raises(FileNotFoundError):
         abe.build_edit_plan(folder=str(folder), audio_file="none.mp3",
                             duration=2.0, verbose=False)
+
+
+# ==========================================================================
+# 素材质量评分（第五项）
+# ==========================================================================
+def test_analyze_assets_quality_metrics(tmp_path):
+    sharp = str(tmp_path / "sharp.mp4")
+    flat = str(tmp_path / "flat.mp4")
+    make_pattern_video(sharp)
+    make_flat_video(flat)
+
+    infos = abe.analyze_assets([sharp, flat], target_duration=2.0)
+    by = {i.name: i for i in infos}
+    assert by["flat.mp4"].sharpness_raw == pytest.approx(0.0, abs=25.0)
+    assert by["sharp.mp4"].sharpness_raw > by["flat.mp4"].sharpness_raw + 100.0
+    # 归一化后 sharp 应为 1.0，flat 为 0.0
+    assert by["sharp.mp4"].sharpness == pytest.approx(1.0, abs=1e-6)
+    assert by["flat.mp4"].sharpness == pytest.approx(0.0, abs=1e-6)
+    assert by["sharp.mp4"].motion > by["flat.mp4"].motion
+    assert 0.0 <= by["flat.mp4"].exposure_score <= 1.0
+    assert by["sharp.mp4"].quality_score > by["flat.mp4"].quality_score
+    for i in infos:
+        assert 0.0 <= i.quality_score <= 1.0
+        assert 0.0 <= i.candidate_score <= 1.0
+        assert 0.0 <= i.usable_ratio <= 1.0
+
+
+def test_quality_weights_aligns_to_clip_names(tmp_path):
+    sharp = str(tmp_path / "a.mp4")
+    flat = str(tmp_path / "b.mp4")
+    make_pattern_video(sharp)
+    make_flat_video(flat)
+    infos = abe.analyze_assets([sharp, flat], target_duration=2.0)
+    weights = abe.quality_weights(infos, ["b.mp4", "a.mp4", "missing.mp4"])
+    assert weights is not None and len(weights) == 3
+    assert weights[1] > weights[0]          # a.mp4 质量更高 -> 权重更大
+    assert weights[2] == pytest.approx(1.0)  # 缺失素材兜底
+    assert abe.quality_weights(infos, None, prefer_quality=False) is None
+
+
+def test_assign_clips_weighted_bias():
+    seq = abe.assign_clips(20, 3, weights=[3.0, 1.0, 1.0])
+    counts = [seq.count(i) for i in range(3)]
+    assert counts[0] == max(counts)
+    assert counts[0] > counts[1]
+    assert all(a != b for a, b in zip(seq, seq[1:]))
+    with pytest.raises(ValueError):
+        abe.assign_clips(5, 2, weights=[1.0])
+
+
+# ==========================================================================
+# 转场语义（cut / dip）
+# ==========================================================================
+def test_plan_segments_default_transition_is_cut(tiny_videos):
+    folder, files = tiny_videos
+    clips, names, _ = abe.prepare_video_clips(files, target_resolution=None)
+    grid = abe.BeatGrid(beats=np.arange(0.0, 6.0, 0.5),
+                        half_beats=np.arange(0.0, 6.0, 0.25), tempo=120.0)
+    boundaries = abe.build_boundaries(grid, 3.0, abe.PATTERN_PRESETS["normal"], verbose=False)
+    assign = abe.assign_clips(len(boundaries) - 1, len(clips))
+    segs, _ = abe.plan_segments(boundaries, assign, clips, grid.beat_duration, clip_names=names)
+    assert all(s.transition == "cut" for s in segs)
+    for c in clips:
+        c.close()
+
+
+def test_dip_transition_is_timing_safe(tmp_path, monkeypatch, tiny_videos):
+    folder, files = tiny_videos
+    audio = os.path.join(folder, "track.wav")
+    synth_click_track(audio, total=12.0, bpm=120.0, active=(0.0, 12.0))
+
+    monkeypatch.setattr(abe, "TARGET_RESOLUTION", (96, 128))
+    monkeypatch.setattr(abe, "TRANSITION_MODE", "dip")
+
+    plan, clips, grid, _ = abe.build_edit_plan(
+        folder=folder, audio_file="track.wav", duration=3.0,
+        audio_start=1.0, auto_select=False,
+        clip_order=["1.mp4", "2.mp4", "10.mp4"],
+        target_resolution=(96, 128), verbose=False,
+    )
+    segs = plan["segments"]
+    # 非快切片段使用 dip，快切片段仍为 cut
+    assert any(s.transition == "dip" for s in segs)
+    assert all(s.transition == "cut" for s in segs if s.is_fast)
+    # EDL 中记录转场类型且校验通过
+    assert all(s["transition"] in ("cut", "dip") for s in plan["edl"]["segments"])
+    problems, critical = abe.validate_edl(plan["edl"])
+    assert critical == [] and problems == []
+
+    final = abe.render_segments(segs, clips, grid)
+    # dip 是段内淡入淡出，不改变任何片段时长 -> 总时长不变
+    assert final.duration == pytest.approx(sum(s.duration for s in segs), abs=0.05)
+    final.close()
+    for c in clips:
+        c.close()
+
