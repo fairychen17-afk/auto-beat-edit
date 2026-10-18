@@ -279,18 +279,36 @@ def probe_audio_duration(audio_path):
         raise RuntimeError(f"无法读取音频 {os.path.basename(audio_path)}: {exc}") from exc
 
 
+def _require_finite_number(value, name):
+    """把 value 转成 float 并要求有限，拒绝 NaN / ±Inf / 非数值。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必须是数值，当前为 {value!r}")
+    if not np.isfinite(num):
+        raise ValueError(f"{name} 必须是有限数值（不能为 NaN/Inf），当前为 {value!r}")
+    return num
+
+
 def validate_audio_window(audio_path, start, duration, total_duration=None):
     """校验音乐起始/时长是否越界，返回实际可用区间 (start, end)。
 
+    - start / duration 为 NaN、±Inf 或非数值 -> ValueError（入口明确拒绝，避免 NaN 静默传播）
     - start 越界 -> ValueError（明确报错，不再静默截断）
     - 区间超出音频尾部 -> 自动收窄并给出警告
     """
-    if duration is None or duration <= 0:
+    duration = _require_finite_number(duration, "AUDIO_DURATION")
+    if duration <= 0:
         raise ValueError(f"AUDIO_DURATION 必须为正数，当前为 {duration}")
-    total = total_duration if total_duration is not None else probe_audio_duration(audio_path)
 
-    if start is None or start < 0:
+    start = _require_finite_number(start, "AUDIO_START")
+    if start < 0:
         raise ValueError(f"AUDIO_START 不能为负数，当前为 {start}")
+
+    total = (probe_audio_duration(audio_path) if total_duration is None
+             else _require_finite_number(total_duration, "音频总长"))
+    if total <= 0:
+        raise ValueError(f"音频总长必须为正数，当前为 {total}")
     if start >= total:
         raise ValueError(
             f"AUDIO_START={start:.3f}s 超出音频总长 {total:.3f}s（{os.path.basename(audio_path)}）"
@@ -1522,6 +1540,7 @@ def validate_edl(edl, min_speed=MIN_SPEED, max_speed=MAX_SPEED, tol=1e-3):
     audio = edl.get("audio") or {}
     want = audio.get("duration")
     a_start = audio.get("start")
+    total = audio.get("total")
     if a_start is not None and (not _finite(a_start) or float(a_start) < -tol):
         critical.append(f"音频区间起点非法: {a_start}")
     if want is None:
@@ -1532,6 +1551,17 @@ def validate_edl(edl, min_speed=MIN_SPEED, max_speed=MAX_SPEED, tol=1e-3):
         drift = abs(cursor - float(want))
         if drift > 0.2:
             problems.append(f"成片总时长 {cursor:.3f}s 与音频区间 {want:.3f}s 偏差 {drift:.3f}s")
+
+    # 计划音频区间不得超过原始音频总长（EDL 提供 audio.total 时才校验；
+    # 旧版 EDL 无该字段则跳过，保持向后兼容）
+    if total is not None and (not _finite(total) or float(total) <= 0):
+        critical.append(f"音频总长非法: {total}")
+    elif total is not None and _finite(a_start) and _finite(want):
+        end = float(a_start) + float(want)
+        if end > float(total) + tol:
+            critical.append(
+                f"计划音频区间 {float(a_start):.3f}s~{end:.3f}s 超出原始音频总长 {float(total):.3f}s"
+            )
     return problems, critical
 
 
@@ -1678,6 +1708,7 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
         "path": os.path.basename(audio_path),
         "start": float(start),
         "duration": float(duration),
+        "total": float(total_audio),
         "tempo": float(beat_grid.tempo),
         "beat_status": beat_grid.status,
         "auto_selected": bool(selection is not None),

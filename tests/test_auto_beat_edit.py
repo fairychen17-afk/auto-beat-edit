@@ -1052,3 +1052,102 @@ def test_analyze_assets_closes_clip_when_metadata_fails(monkeypatch):
     assert made and made[0].closed, "元数据失败路径下 clip 未关闭"
     assert infos and "读取失败" in infos[0].note
 
+
+# ==========================================================================
+# 输入边界加固：validate_audio_window 拒绝 NaN / ±Inf / 非数值
+# ==========================================================================
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_validate_audio_window_rejects_non_finite_start(click_audio, bad):
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=bad, duration=2.0)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_validate_audio_window_rejects_non_finite_duration(click_audio, bad):
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=0.0, duration=bad)
+
+
+@pytest.mark.parametrize("bad", ["abc", None, object()])
+def test_validate_audio_window_rejects_non_numeric(click_audio, bad):
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=bad, duration=2.0)
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=0.0, duration=bad)
+
+
+def test_validate_audio_window_rejects_bad_total_duration(click_audio):
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=0.0, duration=1.0, total_duration=float("nan"))
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=0.0, duration=1.0, total_duration=0.0)
+
+
+def test_validate_audio_window_accepts_normal_input(click_audio):
+    """正常输入不受新增边界校验影响。"""
+    start, end = abe.validate_audio_window(click_audio, start=1.0, duration=2.0)
+    assert start == 1.0 and end == 3.0
+    # 整型 / 数值字符串仍被接受（转成 float）
+    start2, end2 = abe.validate_audio_window(click_audio, start=0, duration=2)
+    assert start2 == 0.0 and end2 == 2.0
+
+
+# ==========================================================================
+# EDL 校验：计划音频区间不得超过原始音频总长
+# ==========================================================================
+def test_validate_edl_flags_audio_interval_exceeding_total():
+    edl = abe.build_edl([_seg()], {"start": 0.0, "duration": 5.0, "total": 4.0},
+                        {"a.mp4": 2.0})
+    _, critical = abe.validate_edl(edl)
+    assert any("超出原始音频总长" in c for c in critical), critical
+
+
+def test_validate_edl_flags_audio_interval_tail_overflow_with_start():
+    # 起点 10s + 时长 3s = 13s > 总长 12s
+    edl = abe.build_edl([_seg()], {"start": 10.0, "duration": 3.0, "total": 12.0},
+                        {"a.mp4": 2.0})
+    _, critical = abe.validate_edl(edl)
+    assert any("超出原始音频总长" in c for c in critical), critical
+
+
+def test_validate_edl_flags_bad_audio_total():
+    edl = abe.build_edl([_seg()], {"start": 0.0, "duration": 1.0, "total": 0.0},
+                        {"a.mp4": 2.0})
+    _, critical = abe.validate_edl(edl)
+    assert any("音频总长非法" in c for c in critical), critical
+
+
+def test_validate_edl_accepts_audio_interval_within_total():
+    edl = abe.build_edl([_seg()], {"start": 10.0, "duration": 2.0, "total": 12.0},
+                        {"a.mp4": 2.0})
+    problems, critical = abe.validate_edl(edl)
+    assert critical == [], critical
+    assert not any("超出原始音频总长" in p for p in problems)
+
+
+def test_validate_edl_without_total_field_still_valid():
+    """旧版 EDL 无 total 字段时应保持向后兼容（不因缺字段而报 critical）。"""
+    edl = abe.build_edl([_seg()], {"start": 0.0, "duration": 1.0}, {"a.mp4": 2.0})
+    problems, critical = abe.validate_edl(edl)
+    assert critical == [], critical
+
+
+def test_build_edit_plan_records_audio_total_and_passes_validation(tmp_path, tiny_videos):
+    """build_edit_plan 生成的 EDL 带 audio.total，且正常区间不触发越界 critical。"""
+    folder, files = tiny_videos
+    audio = os.path.join(folder, "tail.wav")
+    synth_click_track(audio, total=12.0, bpm=120.0, active=(0.0, 12.0))
+    plan, clips, grid, status = abe.build_edit_plan(
+        folder=folder, audio_file="tail.wav", duration=5.0,
+        audio_start=10.0, auto_select=False,
+        clip_order=["1.mp4", "2.mp4", "10.mp4"],
+        target_resolution=(96, 128), verbose=False,
+    )
+    edl = plan["edl"]
+    assert edl["audio"]["total"] == pytest.approx(12.0, abs=0.05)
+    assert edl["audio"]["start"] + edl["audio"]["duration"] <= edl["audio"]["total"] + 1e-3
+    problems, critical = abe.validate_edl(edl)
+    assert critical == [], critical
+    for c in clips:
+        c.close()
+
