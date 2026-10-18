@@ -1151,3 +1151,28 @@ def test_build_edit_plan_records_audio_total_and_passes_validation(tmp_path, tin
     for c in clips:
         c.close()
 
+
+# ==========================================================================
+# 数值边界补漏：probe 返回的音频总长、以及 _require_finite_number 的 OverflowError
+# ==========================================================================
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_validate_audio_window_rejects_non_finite_probed_total(click_audio, monkeypatch, bad):
+    """total_duration=None 时，probe_audio_duration 的返回值也必须为有限数值。"""
+    monkeypatch.setattr(abe, "probe_audio_duration", lambda *a, **k: bad)
+    with pytest.raises(ValueError):
+        abe.validate_audio_window(click_audio, start=0.0, duration=1.0)
+
+
+@pytest.mark.parametrize("bad", [10 ** 400, -(10 ** 400)])
+def test_require_finite_number_handles_overflow(bad):
+    """float() 无法转换的极端整数（OverflowError）必须转成明确的 ValueError。"""
+    with pytest.raises(ValueError):
+        abe._require_finite_number(bad, "测试值")
+
+
+def test_validate_audio_window_normal_probed_total_ok(click_audio, monkeypatch):
+    """正常探得的有限总长不受影响（尾部收窄逻辑保持）。"""
+    monkeypatch.setattr(abe, "probe_audio_duration", lambda *a, **k: 12.0)
+    start, end = abe.validate_audio_window(click_audio, start=10.0, duration=5.0)
+    assert start == 10.0 and end == 12.0
+

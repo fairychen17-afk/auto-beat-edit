@@ -280,10 +280,10 @@ def probe_audio_duration(audio_path):
 
 
 def _require_finite_number(value, name):
-    """把 value 转成 float 并要求有限，拒绝 NaN / ±Inf / 非数值。"""
+    """把 value 转成 float 并要求有限，拒绝 NaN / ±Inf / 非数值 / 无法转换的极端输入。"""
     try:
         num = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{name} 必须是数值，当前为 {value!r}")
     if not np.isfinite(num):
         raise ValueError(f"{name} 必须是有限数值（不能为 NaN/Inf），当前为 {value!r}")
@@ -305,8 +305,11 @@ def validate_audio_window(audio_path, start, duration, total_duration=None):
     if start < 0:
         raise ValueError(f"AUDIO_START 不能为负数，当前为 {start}")
 
-    total = (probe_audio_duration(audio_path) if total_duration is None
-             else _require_finite_number(total_duration, "音频总长"))
+    if total_duration is None:
+        # probe_audio_duration 的返回值同样必须为有限数值，不能让 NaN/Inf 通过
+        total = _require_finite_number(probe_audio_duration(audio_path), "音频总长")
+    else:
+        total = _require_finite_number(total_duration, "音频总长")
     if total <= 0:
         raise ValueError(f"音频总长必须为正数，当前为 {total}")
     if start >= total:
