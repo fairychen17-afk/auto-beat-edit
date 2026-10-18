@@ -30,13 +30,15 @@ from moviepy import AudioFileClip, VideoFileClip, concatenate_videoclips, vfx
 # ==========================================================================
 # 配置
 # ==========================================================================
-FOLDER = r"C:\Users\甘雨\Desktop\虚照"
-AUDIO_FILE = "@饺子WTF创作的原声_7656434362674048997(1).mp3"
-OUTPUT_FILE = os.path.join(FOLDER, "虚照_卡点混剪_究极版.mp4")
+# 以下为「通用默认配置」，故意不含任何个人绝对路径或具体音乐文件名。
+# 全部可用命令行参数覆盖：--folder / --audio / --duration / --audio-start / --strategy / --edl
+FOLDER = "input"                        # 素材文件夹（放素材视频与音乐）
+AUDIO_FILE = "bgm.mp3"                  # 音乐文件名
+OUTPUT_FILE = os.path.join(FOLDER, "output_beat_edit.mp4")
 
 # 音乐起始：给定数值则优先使用（用户指定优先）；
 # 设为 None 时启用自动选段（见 AUTO_SELECT_AUDIO）
-AUDIO_START = 54.0
+AUDIO_START = 0.0
 AUDIO_DURATION = 10.0
 AUTO_SELECT_AUDIO = False          # True 时忽略 AUDIO_START，自动挑选最佳区间
 
@@ -527,18 +529,28 @@ def prepare_video_clips(video_files, target_resolution=None):
             errors.append((name, str(exc)))
             print(f"  错误: {name} 无法读取 - {exc}")
             continue
-        if target_resolution:
-            tw, th = target_resolution
-            cw, ch = clip.size
-            scale = max(tw / cw, th / ch) * 1.2
-            clip = clip.resized(scale)
-            new_w, new_h = clip.size
-            xc, yc = new_w / 2, new_h / 2
-            clip = clip.cropped(
-                x1=int(xc - tw / 2), y1=int(yc - th / 2),
-                x2=int(xc + tw / 2), y2=int(yc + th / 2),
-            )
-        clip = clip.without_audio()
+        # 尺寸统一 / 去音轨失败时，必须关闭已打开的 VideoFileClip，避免句柄泄漏。
+        try:
+            if target_resolution:
+                tw, th = target_resolution
+                cw, ch = clip.size
+                scale = max(tw / cw, th / ch) * 1.2
+                clip = clip.resized(scale)
+                new_w, new_h = clip.size
+                xc, yc = new_w / 2, new_h / 2
+                clip = clip.cropped(
+                    x1=int(xc - tw / 2), y1=int(yc - th / 2),
+                    x2=int(xc + tw / 2), y2=int(yc + th / 2),
+                )
+            clip = clip.without_audio()
+        except Exception as exc:  # noqa: BLE001 - 处理失败也要释放资源
+            errors.append((name, str(exc)))
+            print(f"  错误: {name} 处理失败 - {exc}")
+            try:
+                clip.close()
+            except Exception:  # noqa: BLE001
+                pass
+            continue
         clips.append(clip)
         names.append(name)
         print(f"  [{i + 1}] {name} - {clip.duration:.2f}s")
@@ -663,32 +675,39 @@ def analyze_assets(video_files, target_duration=0.0, sample_frames=QUALITY_SAMPL
                                    aspect=0.0, has_audio=False, note=f"无法读取: {exc}"))
             continue
 
-        w, h = clip.size
-        info = AssetInfo(
-            name=name,
-            duration=float(clip.duration or 0.0),
-            width=int(w),
-            height=int(h),
-            aspect=(w / h if h else 0.0),
-            has_audio=clip.audio is not None,
-        )
-        info.estimated_usable = info.duration
-        info.usable_ratio = (min(info.duration / target_duration, 1.0)
-                             if target_duration > 0 else 1.0)
+        # 用 try/finally 保证无论元数据读取、帧采样是否抛错，clip 都会被关闭，
+        # 避免异常路径下 VideoFileClip 句柄泄漏（文件被占用）。
         try:
-            grays = _sample_gray_frames(clip, sample_frames)
-            if grays:
-                info.sharpness_raw = float(np.mean([_laplacian_variance(g) for g in grays]))
-                info.exposure_score = float(np.mean([_exposure_score(g) for g in grays]))
-                if len(grays) >= 2:
-                    info.motion_raw = float(np.mean([
-                        np.mean(np.abs(grays[i + 1] - grays[i])) / 255.0
-                        for i in range(len(grays) - 1)
-                    ]))
-            info.window_times, info.window_score = _window_profile(clip)
-        except Exception as exc:  # noqa: BLE001
-            info.note = f"帧采样失败: {exc}"
-        clip.close()
+            w, h = clip.size
+            info = AssetInfo(
+                name=name,
+                duration=float(clip.duration or 0.0),
+                width=int(w),
+                height=int(h),
+                aspect=(w / h if h else 0.0),
+                has_audio=clip.audio is not None,
+            )
+            info.estimated_usable = info.duration
+            info.usable_ratio = (min(info.duration / target_duration, 1.0)
+                                 if target_duration > 0 else 1.0)
+            try:
+                grays = _sample_gray_frames(clip, sample_frames)
+                if grays:
+                    info.sharpness_raw = float(np.mean([_laplacian_variance(g) for g in grays]))
+                    info.exposure_score = float(np.mean([_exposure_score(g) for g in grays]))
+                    if len(grays) >= 2:
+                        info.motion_raw = float(np.mean([
+                            np.mean(np.abs(grays[i + 1] - grays[i])) / 255.0
+                            for i in range(len(grays) - 1)
+                        ]))
+                info.window_times, info.window_score = _window_profile(clip)
+            except Exception as exc:  # noqa: BLE001
+                info.note = f"帧采样失败: {exc}"
+        except Exception as exc:  # noqa: BLE001 - 元数据读取失败也记为无效素材
+            info = AssetInfo(name=name, duration=0.0, width=0, height=0,
+                             aspect=0.0, has_audio=False, note=f"读取失败: {exc}")
+        finally:
+            clip.close()
         infos.append(info)
 
     _score_asset_quality(infos)
@@ -1438,41 +1457,78 @@ def build_edl(segments, audio_info, clip_durations,
 
 
 def validate_edl(edl, min_speed=MIN_SPEED, max_speed=MAX_SPEED, tol=1e-3):
-    """执行前校验剪辑计划，返回问题列表（critical 直接抛错，其余为警告）。"""
+    """执行前校验剪辑计划，返回 (problems, critical)。
+
+    critical 表示计划不可执行（调用方直接抛错），problems 为可疑但可继续的警告。
+    校验覆盖：时间轴连续性、片段时长自洽、非有限数值、非法源时间、无效素材引用、
+    倍速范围、转场类型，以及计划音频区间边界。
+    """
     problems, critical = [], []
+
+    def _finite(v):
+        try:
+            return bool(np.isfinite(float(v)))
+        except (TypeError, ValueError):
+            return False
+
     segs = edl.get("segments") or []
     if not segs:
         critical.append("剪辑计划为空")
         return problems, critical
 
     clip_durations = edl.get("clip_durations") or {}
+    numeric_fields = ("timeline_start", "timeline_end", "duration",
+                      "source_in", "source_out", "speed")
     cursor = 0.0
     for s in segs:
+        idx = s.get("index")
+
+        # 非有限数值（NaN/Inf/缺失/非数）直接判为不可执行，避免 NaN 悄悄传播
+        bad = [k for k in numeric_fields if not _finite(s.get(k))]
+        if bad:
+            critical.append(f"片段{idx} 存在非有限数值: {', '.join(bad)}")
+            continue
+
+        # 无效素材引用：EDL 已记录素材时长，却找不到该 clip_name
+        if clip_durations and s.get("clip_name") not in clip_durations:
+            critical.append(f"片段{idx} 引用了未知素材: {s.get('clip_name')}")
+
+        # 非法源时间：负入点 / 空源区间 / 源出点超出素材实际时长
+        src_in, src_out = s["source_in"], s["source_out"]
+        if src_in < -tol:
+            critical.append(f"片段{idx} 源入点为负: {src_in:.4f}s")
+        if src_out - src_in <= 0:
+            critical.append(f"片段{idx} 源区间为空")
+        dur = clip_durations.get(s.get("clip_name"))
+        if dur is not None and src_out > dur + 0.05:
+            critical.append(
+                f"片段{idx} 源出点 {src_out:.3f}s 超出素材 {s.get('clip_name')} 时长 {dur:.3f}s"
+            )
+
         if abs(s["timeline_start"] - cursor) > tol:
             problems.append(
-                f"片段{s['index']} 时间轴不连续: start={s['timeline_start']:.4f}s，应为 {cursor:.4f}s"
+                f"片段{idx} 时间轴不连续: start={s['timeline_start']:.4f}s，应为 {cursor:.4f}s"
             )
         if abs((s["timeline_end"] - s["timeline_start"]) - s["duration"]) > tol:
-            problems.append(f"片段{s['index']} duration 与区间不一致")
-        if s["source_in"] < -tol:
-            critical.append(f"片段{s['index']} 源入点为负: {s['source_in']:.4f}s")
-        if s["source_out"] - s["source_in"] <= 0:
-            critical.append(f"片段{s['index']} 源区间为空")
-        dur = clip_durations.get(s["clip_name"])
-        if dur is not None and s["source_out"] > dur + 0.05:
-            critical.append(
-                f"片段{s['index']} 源出点 {s['source_out']:.3f}s 超出素材 {s['clip_name']} 时长 {dur:.3f}s"
-            )
+            problems.append(f"片段{idx} duration 与区间不一致")
         if not (min_speed - 1e-6 <= s["speed"] <= max_speed + 1e-6):
-            problems.append(f"片段{s['index']} 倍速 {s['speed']:.3f} 超出 [{min_speed}, {max_speed}]")
+            problems.append(f"片段{idx} 倍速 {s['speed']:.3f} 超出 [{min_speed}, {max_speed}]")
         trans = s.get("transition", "cut")
         if trans not in ("cut", "dip"):
-            problems.append(f"片段{s['index']} 未知转场类型: {trans}")
+            problems.append(f"片段{idx} 未知转场类型: {trans}")
         cursor = s["timeline_end"]
 
+    # 计划音频区间边界：起点非负、时长有限且为正，并与成片总时长比对
     audio = edl.get("audio") or {}
     want = audio.get("duration")
-    if want:
+    a_start = audio.get("start")
+    if a_start is not None and (not _finite(a_start) or float(a_start) < -tol):
+        critical.append(f"音频区间起点非法: {a_start}")
+    if want is None:
+        problems.append("EDL 缺少计划音频区间时长")
+    elif not _finite(want) or float(want) <= 0:
+        critical.append(f"音频区间时长非法: {want}")
+    elif _finite(a_start):
         drift = abs(cursor - float(want))
         if drift > 0.2:
             problems.append(f"成片总时长 {cursor:.3f}s 与音频区间 {want:.3f}s 偏差 {drift:.3f}s")
@@ -1536,6 +1592,22 @@ def build_edit_plan(folder=FOLDER, audio_file=AUDIO_FILE, duration=AUDIO_DURATIO
         status["messages"].extend(selection["reasons"])
     else:
         start, _end = validate_audio_window(audio_path, audio_start, duration, total_audio)
+
+    # 请求时长可能超过音乐「实际可用」长度：自动选段在音乐不足时会返回整段（duration
+    # 已被改为实际总长），手动起点也可能因尾部越界被 validate_audio_window 收窄。
+    # 一旦如此，后续分段 / EDL / 渲染必须统一改用「实际可用时长」，否则会出现
+    # 「成片按请求时长生成、音频却在区间末尾提前结束」的总时长不一致。
+    effective_duration = float(_end - start)
+    if effective_duration <= 0:
+        raise RuntimeError(
+            f"音乐可用区间无效: start={start:.3f}s, end={_end:.3f}s（{os.path.basename(audio_path)}）"
+        )
+    if effective_duration < duration - 1e-6:
+        note = (f"请求时长 {duration:.2f}s 超过音乐实际可用 {effective_duration:.2f}s，"
+                f"已按实际可用时长 {effective_duration:.2f}s 生成计划")
+        print(f"  提示: {note}")
+        status["messages"].append(note)
+    duration = effective_duration
 
     if verbose:
         print(f"\n分析音乐（{start:.2f}s 起，取 {duration:.2f}s）...")

@@ -50,15 +50,17 @@ pip install -r requirements.txt
 3. 修改脚本顶部的配置：
 
 ```python
-FOLDER = r"C:\path\to\your\folder"      # 素材文件夹路径
-AUDIO_FILE = "your_music.mp3"           # 音乐文件名
-AUDIO_START = 54.0                      # 从音乐第几秒开始（用户指定优先）
+FOLDER = "input"                        # 素材文件夹路径（默认相对路径，避免写死个人绝对路径）
+AUDIO_FILE = "bgm.mp3"                  # 音乐文件名
+AUDIO_START = 0.0                       # 从音乐第几秒开始（用户指定优先）
 AUTO_SELECT_AUDIO = False               # True 时忽略 AUDIO_START，自动挑选最佳区间
 AUDIO_DURATION = 10.0                   # 输出时长（秒）
 TARGET_RESOLUTION = (720, 960)          # 输出分辨率
 CLIP_ORDER = ["1.mp4", "2.mp4", "3.mp4", "4.mp4"]  # 素材顺序（留空则自动扫描）
 EDIT_STRATEGY = "normal"                # normal / slow / fast
 ```
+
+> 默认配置为**通用占位值**（不放任何个人绝对路径或具体音乐文件名），运行时可用命令行参数覆盖，或直接改脚本顶部这几个常量。
 
 4. 运行：
 
@@ -100,9 +102,9 @@ python -m pytest tests -q
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `FOLDER` | 素材文件夹路径 | - |
-| `AUDIO_FILE` | 音乐文件名 | - |
-| `AUDIO_START` | 音乐起始时间（秒）；设 `None` 启用自动选段 | 54.0 |
+| `FOLDER` | 素材文件夹路径 | `input` |
+| `AUDIO_FILE` | 音乐文件名 | `bgm.mp3` |
+| `AUDIO_START` | 音乐起始时间（秒）；设 `None` 启用自动选段 | 0.0 |
 | `AUTO_SELECT_AUDIO` | 是否自动挑选最佳音乐区间 | False |
 | `AUDIO_DURATION` | 输出视频时长（秒） | 10.0 |
 | `TARGET_RESOLUTION` | 输出分辨率 (宽, 高) | (720, 960) |

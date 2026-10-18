@@ -865,3 +865,190 @@ def test_build_edit_plan_window_select_keeps_edl_valid(tmp_path, monkeypatch, ti
     for c in clips:
         c.close()
 
+
+# ==========================================================================
+# 时长传递：请求时长 > 音乐实际可用时，计划必须改用「实际可用时长」
+# （覆盖完整剪辑计划，而不只是单独测 select_audio_segment）
+# ==========================================================================
+def test_plan_short_audio_uses_actual_duration_not_requested(tmp_path, tiny_videos):
+    """音乐(4s)短于目标时长(10s)：自动选段返回的实际时长必须贯穿到分段/EDL，
+    成片计划不能仍按请求的 10s 生成，否则音频会在 4s 处提前结束。"""
+    folder, files = tiny_videos
+    audio = os.path.join(folder, "short.wav")
+    synth_click_track(audio, total=4.0, bpm=120.0, active=(0.0, 4.0))
+
+    plan, clips, grid, status = abe.build_edit_plan(
+        folder=folder, audio_file="short.wav", duration=10.0,
+        audio_start=None, auto_select=True,
+        clip_order=["1.mp4", "2.mp4", "10.mp4"],
+        target_resolution=(96, 128), verbose=False,
+    )
+    edl = plan["edl"]
+    # 计划音频区间 / 目标时长都应是实际可用 4s，而不是请求的 10s
+    assert edl["audio"]["duration"] == pytest.approx(4.0, abs=0.05)
+    assert edl["target_duration"] == pytest.approx(4.0, abs=0.05)
+    assert edl["audio"]["start"] == pytest.approx(0.0)
+
+    total = edl["segments"][-1]["timeline_end"]
+    assert total == pytest.approx(4.0, abs=0.2)
+    assert total < 10.0 - 0.5, "成片不能按请求时长 10s 生成"
+    # 成片总时长不超过计划音频区间，避免「视频比音频长」
+    assert total <= edl["audio"]["duration"] + 0.2
+
+    problems, critical = abe.validate_edl(edl)
+    assert critical == []
+    assert not any("偏差" in p for p in problems)
+    # 明确记录了「请求超过实际可用」的提示
+    assert any("超过音乐实际可用" in m for m in status["messages"])
+    for c in clips:
+        c.close()
+
+
+def test_plan_audio_equal_to_target_keeps_requested_duration(tmp_path, tiny_videos):
+    """音乐恰好等于目标时长：不应被误改，计划时长 = 请求时长。"""
+    folder, files = tiny_videos
+    audio = os.path.join(folder, "exact.wav")
+    synth_click_track(audio, total=4.0, bpm=120.0, active=(0.0, 4.0))
+
+    plan, clips, grid, status = abe.build_edit_plan(
+        folder=folder, audio_file="exact.wav", duration=4.0,
+        audio_start=0.0, auto_select=False,
+        clip_order=["1.mp4", "2.mp4", "10.mp4"],
+        target_resolution=(96, 128), verbose=False,
+    )
+    edl = plan["edl"]
+    assert edl["audio"]["duration"] == pytest.approx(4.0, abs=0.05)
+    assert edl["target_duration"] == pytest.approx(4.0, abs=0.05)
+    assert edl["segments"][-1]["timeline_end"] == pytest.approx(4.0, abs=0.2)
+    problems, critical = abe.validate_edl(edl)
+    assert critical == []
+    assert not any("超过音乐实际可用" in m for m in status["messages"])
+    for c in clips:
+        c.close()
+
+
+def test_plan_audio_tail_overflow_uses_actual_interval(tmp_path, tiny_videos):
+    """起点+时长超出音频尾部（10s + 5s > 12s）：收窄后的实际区间必须被采用。"""
+    folder, files = tiny_videos
+    audio = os.path.join(folder, "full.wav")
+    synth_click_track(audio, total=12.0, bpm=120.0, active=(0.0, 12.0))
+
+    plan, clips, grid, status = abe.build_edit_plan(
+        folder=folder, audio_file="full.wav", duration=5.0,
+        audio_start=10.0, auto_select=False,
+        clip_order=["1.mp4", "2.mp4", "10.mp4"],
+        target_resolution=(96, 128), verbose=False,
+    )
+    edl = plan["edl"]
+    # 起点保持 10s，但区间只有 10s~12s（实际 2s）
+    assert edl["audio"]["start"] == pytest.approx(10.0)
+    assert edl["audio"]["duration"] == pytest.approx(2.0, abs=0.1)
+    assert edl["target_duration"] == pytest.approx(2.0, abs=0.1)
+    total = edl["segments"][-1]["timeline_end"]
+    assert total == pytest.approx(2.0, abs=0.25)
+    assert total < 5.0 - 0.5, "成片不能按请求的 5s 生成"
+
+    problems, critical = abe.validate_edl(edl)
+    assert critical == []
+    assert any("超过音乐实际可用" in m for m in status["messages"])
+    for c in clips:
+        c.close()
+
+
+# ==========================================================================
+# EDL 校验增强：非有限数值 / 无效素材引用 / 计划音频区间边界
+# ==========================================================================
+def _seg(**kw):
+    base = dict(index=0, clip_index=0, clip_name="a.mp4", label="x",
+                timeline_start=0.0, timeline_end=1.0, duration=1.0,
+                source_in=0.0, source_out=1.0, speed=1.0, is_fast=False)
+    base.update(kw)
+    return abe.EditSegment(**base)
+
+
+def test_validate_edl_flags_non_finite_values():
+    edl = abe.build_edl([_seg(timeline_end=float("nan"), duration=float("nan"))],
+                        {"start": 0.0, "duration": 1.0}, {"a.mp4": 2.0})
+    problems, critical = abe.validate_edl(edl)
+    assert any("非有限数值" in c for c in critical), critical
+
+    edl2 = abe.build_edl([_seg(speed=float("inf"))],
+                         {"start": 0.0, "duration": 1.0}, {"a.mp4": 2.0})
+    _, crit2 = abe.validate_edl(edl2)
+    assert any("非有限数值" in c for c in crit2), crit2
+
+
+def test_validate_edl_flags_unknown_clip_reference():
+    edl = abe.build_edl([_seg(clip_name="ghost.mp4")],
+                        {"start": 0.0, "duration": 1.0}, {"a.mp4": 2.0})
+    problems, critical = abe.validate_edl(edl)
+    assert any("未知素材" in c for c in critical), critical
+
+
+def test_validate_edl_flags_bad_audio_interval_boundaries():
+    neg = abe.build_edl([_seg()], {"start": -2.0, "duration": 1.0}, {"a.mp4": 2.0})
+    _, crit = abe.validate_edl(neg)
+    assert any("音频区间起点非法" in c for c in crit), crit
+
+    zero = abe.build_edl([_seg()], {"start": 0.0, "duration": 0.0}, {"a.mp4": 2.0})
+    _, crit2 = abe.validate_edl(zero)
+    assert any("音频区间时长非法" in c for c in crit2), crit2
+
+
+# ==========================================================================
+# 资源释放：VideoFileClip 必须在异常路径下也被关闭
+# ==========================================================================
+class _FakeClip:
+    size = (64, 80)
+    duration = 2.0
+    audio = None
+
+    def __init__(self, *a, **k):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    def get_frame(self, t):
+        return np.zeros((80, 64, 3), dtype=np.uint8)
+
+
+def test_analyze_assets_closes_clip_when_sampling_fails(monkeypatch):
+    """帧采样抛错时也必须关闭 VideoFileClip（原实现只在成功末尾 close）。"""
+    made = []
+
+    def factory(*a, **k):
+        c = _FakeClip()
+        made.append(c)
+        return c
+
+    def boom(*a, **k):
+        raise RuntimeError("采样失败")
+
+    monkeypatch.setattr(abe, "VideoFileClip", factory)
+    monkeypatch.setattr(abe, "_sample_gray_frames", boom)
+
+    infos = abe.analyze_assets(["x.mp4"], target_duration=2.0)
+    assert made and made[0].closed, "采样失败路径下 clip 未关闭"
+    assert infos and "帧采样失败" in infos[0].note
+
+
+def test_analyze_assets_closes_clip_when_metadata_fails(monkeypatch):
+    """读取 size/duration 抛错时也必须关闭 VideoFileClip。"""
+    made = []
+
+    class _BrokenClip(_FakeClip):
+        @property
+        def size(self):
+            raise RuntimeError("坏元数据")
+
+    def factory(*a, **k):
+        c = _BrokenClip()
+        made.append(c)
+        return c
+
+    monkeypatch.setattr(abe, "VideoFileClip", factory)
+    infos = abe.analyze_assets(["x.mp4"], target_duration=2.0)
+    assert made and made[0].closed, "元数据失败路径下 clip 未关闭"
+    assert infos and "读取失败" in infos[0].note
+
